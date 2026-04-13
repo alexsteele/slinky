@@ -55,10 +55,10 @@ Totally self hosted. Easy setup. No third party managed service.
 
 - Config
   - sync root
-  - ignore rules
   - repo ID
   - device ID
-  - credentials
+  - public key
+  - private key path
   - local snapshot
   - remote frontier
   - pending transfers
@@ -88,6 +88,14 @@ Totally self hosted. Easy setup. No third party managed service.
 - Blob
   - hash
   - size
+
+## Auth
+
+- Devices identify themselves with public/private key pairs.
+- Coordinators authenticate devices with signed challenges.
+- Peers authenticate each other the same way for direct transfer.
+- Repo membership determines which device keys are allowed to sync.
+- Setup should make it easy to add and trust a new device.
 
 ## Conflict Resolution
 

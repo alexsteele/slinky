@@ -207,6 +207,34 @@ impl Tree {
         self.hash = self.compute_hash();
         self.hash
     }
+
+    /// Computes a path-based diff between two materialized tree views.
+    ///
+    /// The trees themselves only store child hashes, so callers provide the resolved file maps
+    /// for the previous and current roots.
+    pub fn diff(
+        previous: &BTreeMap<String, File>,
+        current: &BTreeMap<String, File>,
+    ) -> TreeDiff {
+        let mut diff = TreeDiff {
+            entries: BTreeMap::new(),
+        };
+
+        for path in previous.keys() {
+            if !current.contains_key(path) {
+                diff.insert_path(Path::new(path), TreeChange::Delete);
+            }
+        }
+
+        for (path, file) in current {
+            match previous.get(path) {
+                Some(previous_file) if previous_file.hash == file.hash => {}
+                _ => diff.insert_path(Path::new(path), TreeChange::File(file.clone())),
+            }
+        }
+
+        diff
+    }
 }
 
 /// One named edge from a tree to either a child tree or a file object.
@@ -326,4 +354,79 @@ pub struct SnapshotAnnouncement {
     pub repo_id: RepoId,
     pub snapshot: SnapshotHash,
     pub device: DeviceId,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{File, Tree, TreeChange};
+
+    fn file(path: &str, tag: u8) -> File {
+        let mut file = File {
+            path: path.to_string(),
+            hash: [0; 32],
+            blobs: vec![[tag; 32]],
+        };
+        file.update_hash();
+        file
+    }
+
+    #[test]
+    fn tree_diff_reports_add_change_and_delete() {
+        let previous = BTreeMap::from([
+            ("alpha.txt".to_string(), file("alpha.txt", 1)),
+            ("beta.txt".to_string(), file("beta.txt", 2)),
+        ]);
+        let current = BTreeMap::from([
+            ("alpha.txt".to_string(), file("alpha.txt", 3)),
+            ("gamma.txt".to_string(), file("gamma.txt", 4)),
+        ]);
+
+        let diff = Tree::diff(&previous, &current);
+
+        match diff.entries.get("alpha.txt") {
+            Some(TreeChange::File(file)) => assert_eq!(file.path, "alpha.txt"),
+            other => panic!("expected changed alpha.txt file entry, got {other:?}"),
+        }
+        match diff.entries.get("beta.txt") {
+            Some(TreeChange::Delete) => {}
+            other => panic!("expected beta.txt delete entry, got {other:?}"),
+        }
+        match diff.entries.get("gamma.txt") {
+            Some(TreeChange::File(file)) => assert_eq!(file.path, "gamma.txt"),
+            other => panic!("expected gamma.txt file entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tree_diff_nests_changes_under_directories() {
+        let previous = BTreeMap::from([
+            ("docs/guide.md".to_string(), file("docs/guide.md", 1)),
+            ("docs/old.md".to_string(), file("docs/old.md", 2)),
+        ]);
+        let current = BTreeMap::from([
+            ("docs/guide.md".to_string(), file("docs/guide.md", 3)),
+            ("docs/new.md".to_string(), file("docs/new.md", 4)),
+        ]);
+
+        let diff = Tree::diff(&previous, &current);
+        let docs = match diff.entries.get("docs") {
+            Some(TreeChange::Tree(diff)) => diff,
+            other => panic!("expected nested docs tree diff, got {other:?}"),
+        };
+
+        match docs.entries.get("guide.md") {
+            Some(TreeChange::File(file)) => assert_eq!(file.path, "docs/guide.md"),
+            other => panic!("expected changed guide.md file entry, got {other:?}"),
+        }
+        match docs.entries.get("old.md") {
+            Some(TreeChange::Delete) => {}
+            other => panic!("expected old.md delete entry, got {other:?}"),
+        }
+        match docs.entries.get("new.md") {
+            Some(TreeChange::File(file)) => assert_eq!(file.path, "docs/new.md"),
+            other => panic!("expected new.md file entry, got {other:?}"),
+        }
+    }
 }

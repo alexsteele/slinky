@@ -3,13 +3,15 @@
 //! The engine owns decisions and state transitions. External runtime tasks feed it events and
 //! execute the jobs it emits.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
 use crate::core::{
-    BlobHash, ChangeSet, Config, DeviceState, Frontier, Object, Snapshot, SnapshotHash,
+    BlobHash, ChangeSet, Config, DeviceState, File, Frontier, Object, ObjectId, Snapshot,
+    SnapshotHash, TreeDiff,
 };
 use crate::local::build_snapshot;
 use crate::services::{
@@ -172,13 +174,20 @@ impl SyncEngine {
     /// Builds and publishes the current local filesystem state as a new snapshot.
     pub async fn publish_local_snapshot(&mut self) -> Result<SnapshotHash> {
         self.coordinator.register_device(&self.config).await?;
-        let staged = self.build_local_snapshot(self.state.snapshot).await?;
+        let staged = self.stage_local_snapshot(self.state.snapshot).await?;
         self.publish_staged_snapshot(&staged).await
     }
 
     /// Persists and publishes a previously staged snapshot, then advances local device state.
     pub async fn publish_staged_snapshot(&mut self, staged: &StagedSnapshot) -> Result<SnapshotHash> {
-        self.persist_staged_snapshot(staged).await?;
+        let mut staged = staged.clone();
+        staged.change_set = ChangeSet {
+            base: self.state.snapshot,
+            target: staged.snapshot.hash,
+            diff: self.build_change_diff(self.state.snapshot, &staged.tree).await?,
+        };
+
+        self.persist_staged_snapshot(&staged).await?;
         self.coordinator
             .publish_snapshot(&staged.snapshot, &staged.change_set)
             .await?;
@@ -269,24 +278,13 @@ impl SyncEngine {
     }
 
     /// Builds a staged snapshot from the current local sync root and previous tip.
-    async fn build_local_snapshot(
+    async fn stage_local_snapshot(
         &self,
         base_snapshot: SnapshotHash,
     ) -> Result<StagedSnapshot> {
         let tree = self.tree_builder.build_tree(&self.config.sync_root).await?;
         let snapshot = build_snapshot(&self.config.device_id, tree.root.hash, Some(&base_snapshot));
-        let mut diff = crate::core::TreeDiff {
-            entries: std::collections::BTreeMap::new(),
-        };
-
-        for object in &tree.objects {
-            if let Object::File(file) = object {
-                diff.insert_path(
-                    std::path::Path::new(&file.path),
-                    crate::core::TreeChange::File(file.clone()),
-                );
-            }
-        }
+        let diff = self.build_change_diff(base_snapshot, &tree).await?;
 
         Ok(StagedSnapshot {
             change_set: ChangeSet {
@@ -297,6 +295,97 @@ impl SyncEngine {
             tree,
             snapshot,
         })
+    }
+
+    async fn build_change_diff(
+        &self,
+        base_snapshot: SnapshotHash,
+        tree: &crate::services::StagedTree,
+    ) -> Result<TreeDiff> {
+        let previous_files = self.load_snapshot_files(base_snapshot).await?;
+        let current_files = self.collect_staged_files(tree);
+        Ok(crate::core::Tree::diff(&previous_files, &current_files))
+    }
+
+    async fn load_snapshot_files(&self, snapshot_hash: SnapshotHash) -> Result<BTreeMap<String, File>> {
+        if snapshot_hash == [0; 32] {
+            return Ok(BTreeMap::new());
+        }
+
+        let snapshot = match self
+            .obj_store
+            .load_object(&ObjectId::Snapshot(snapshot_hash))
+            .await?
+        {
+            Object::Snapshot(snapshot) => snapshot,
+            _ => {
+                return Err(crate::services::SyncError::InvalidState(
+                    "snapshot object lookup returned wrong type".into(),
+                ))
+            }
+        };
+
+        self.load_tree_files(snapshot.tree_hash, PathBuf::new()).await
+    }
+
+    async fn load_tree_files(
+        &self,
+        tree_hash: crate::core::TreeHash,
+        prefix: PathBuf,
+    ) -> Result<BTreeMap<String, File>> {
+        let tree = match self.obj_store.load_object(&ObjectId::Tree(tree_hash)).await? {
+            Object::Tree(tree) => tree,
+            _ => {
+                return Err(crate::services::SyncError::InvalidState(
+                    "tree object lookup returned wrong type".into(),
+                ))
+            }
+        };
+
+        let mut files = BTreeMap::new();
+        let mut pending = vec![(tree, prefix)];
+
+        while let Some((tree, prefix)) = pending.pop() {
+            for entry in tree.entries {
+                let path = prefix.join(&entry.name);
+                match entry.hash {
+                    crate::core::ObjectHash::Tree(hash) => {
+                        let child = match self.obj_store.load_object(&ObjectId::Tree(hash)).await? {
+                            Object::Tree(tree) => tree,
+                            _ => {
+                                return Err(crate::services::SyncError::InvalidState(
+                                    "tree object lookup returned wrong type".into(),
+                                ))
+                            }
+                        };
+                        pending.push((child, path));
+                    }
+                    crate::core::ObjectHash::File(hash) => {
+                        let file = match self.obj_store.load_object(&ObjectId::File(hash)).await? {
+                            Object::File(file) => file,
+                            _ => {
+                                return Err(crate::services::SyncError::InvalidState(
+                                    "file object lookup returned wrong type".into(),
+                                ))
+                            }
+                        };
+                        files.insert(path.to_string_lossy().into_owned(), file);
+                    }
+                }
+            }
+        }
+
+        Ok(files)
+    }
+
+    fn collect_staged_files(&self, tree: &crate::services::StagedTree) -> BTreeMap<String, File> {
+        tree.objects
+            .iter()
+            .filter_map(|object| match object {
+                Object::File(file) => Some((file.path.clone(), file.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     fn make_stage_job(&self) -> StageJob {

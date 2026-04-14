@@ -73,11 +73,10 @@ impl SyncService {
             .ok_or_else(|| SyncError::InvalidState("sync engine is not available".into()))?;
         let (config, _) = engine.load_context().await?;
 
-        engine.publish_startup_snapshot().await?;
-
         let watcher = engine.watcher.clone();
         let local_change_tx = self.channels.local_change_tx.clone();
         let sync_root = config.sync_root.clone();
+        let engine_event_tx = self.channels.engine_event_tx.clone();
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         self.shutdown_tx = Some(shutdown_tx);
@@ -91,6 +90,10 @@ impl SyncService {
             .take()
             .ok_or_else(|| SyncError::InvalidState("sync engine already moved".into()))?;
         self.engine_task = Some(tokio::spawn(Self::run_engine_loop(engine, shutdown_rx)));
+        engine_event_tx
+            .send(EngineEvent::Startup)
+            .await
+            .map_err(|_| SyncError::InvalidState("engine event channel closed".into()))?;
 
         Ok(())
     }
@@ -154,6 +157,11 @@ impl SyncService {
             };
 
             let should_stop = matches!(event, EngineEvent::Shutdown);
+
+            if matches!(event, EngineEvent::Startup | EngineEvent::LocalChange(_)) {
+                engine.publish_startup_snapshot().await?;
+            }
+
             let jobs = engine.handle_event(event);
             for job in jobs {
                 engine

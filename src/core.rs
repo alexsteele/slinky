@@ -4,6 +4,7 @@
 //! that the rest of the system passes around.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -132,6 +133,38 @@ pub struct ChangeSet {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeDiff {
     pub entries: BTreeMap<String, TreeChange>,
+}
+
+impl TreeDiff {
+    /// Inserts a change at a relative path, creating nested tree diff nodes as needed.
+    pub fn insert_path(&mut self, path: &Path, change: TreeChange) {
+        let mut components = path.components();
+        if let Some(component) = components.next() {
+            let name = component.as_os_str().to_string_lossy().into_owned();
+            if components.as_path().as_os_str().is_empty() {
+                self.entries.insert(name, change);
+                return;
+            }
+
+            let entry = self
+                .entries
+                .entry(name)
+                .or_insert_with(|| TreeChange::Tree(TreeDiff {
+                    entries: BTreeMap::new(),
+                }));
+
+            match entry {
+                TreeChange::Tree(child) => child.insert_path(components.as_path(), change),
+                _ => {
+                    let mut child = TreeDiff {
+                        entries: BTreeMap::new(),
+                    };
+                    child.insert_path(components.as_path(), change);
+                    *entry = TreeChange::Tree(child);
+                }
+            }
+        }
+    }
 }
 
 /// A change to a single tree entry.

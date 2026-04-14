@@ -167,35 +167,12 @@ impl SyncEngine {
         Ok((config, state))
     }
 
-    /// Performs the current one-shot startup publish path before the full runtime loop exists.
-    pub async fn publish_startup_snapshot(&self) -> Result<SnapshotHash> {
+    /// Builds and publishes the current local filesystem state as a new snapshot.
+    pub async fn publish_local_snapshot(&self) -> Result<SnapshotHash> {
         let (config, mut state) = self.load_context().await?;
 
         self.coordinator.register_device(&config).await?;
-
-        let tree = self.tree_builder.build_tree(&config.sync_root).await?;
-        let snapshot = build_snapshot(&config.device_id, tree.root.hash, Some(&state.snapshot));
-        let mut diff = crate::core::TreeDiff {
-            entries: std::collections::BTreeMap::new(),
-        };
-        for object in &tree.objects {
-            if let Object::File(file) = object {
-                crate::local::util::insert_tree_change(
-                    &mut diff,
-                    std::path::Path::new(&file.path),
-                    crate::core::TreeChange::File(file.clone()),
-                );
-            }
-        }
-        let staged = StagedSnapshot {
-            change_set: ChangeSet {
-                base: state.snapshot,
-                target: snapshot.hash,
-                diff,
-            },
-            tree,
-            snapshot,
-        };
+        let staged = self.build_local_snapshot(&config, state.snapshot).await?;
 
         self.persist_staged_snapshot(&staged).await?;
         self.coordinator
@@ -288,5 +265,37 @@ impl SyncEngine {
             .save_object(&Object::Snapshot(staged.snapshot.clone()))
             .await?;
         Ok(())
+    }
+
+    /// Builds a staged snapshot from the current local sync root and previous tip.
+    async fn build_local_snapshot(
+        &self,
+        config: &Config,
+        base_snapshot: SnapshotHash,
+    ) -> Result<StagedSnapshot> {
+        let tree = self.tree_builder.build_tree(&config.sync_root).await?;
+        let snapshot = build_snapshot(&config.device_id, tree.root.hash, Some(&base_snapshot));
+        let mut diff = crate::core::TreeDiff {
+            entries: std::collections::BTreeMap::new(),
+        };
+
+        for object in &tree.objects {
+            if let Object::File(file) = object {
+                diff.insert_path(
+                    std::path::Path::new(&file.path),
+                    crate::core::TreeChange::File(file.clone()),
+                );
+            }
+        }
+
+        Ok(StagedSnapshot {
+            change_set: ChangeSet {
+                base: base_snapshot,
+                target: snapshot.hash,
+                diff,
+            },
+            tree,
+            snapshot,
+        })
     }
 }

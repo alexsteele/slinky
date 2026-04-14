@@ -159,7 +159,7 @@ impl SyncService {
             let should_stop = matches!(event, EngineEvent::Shutdown);
 
             if matches!(event, EngineEvent::Startup | EngineEvent::LocalChange(_)) {
-                engine.publish_startup_snapshot().await?;
+                engine.publish_local_snapshot().await?;
             }
 
             let jobs = engine.handle_event(event);

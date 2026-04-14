@@ -1,9 +1,8 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::core::{BlobHash, Config, TreeChange, TreeDiff};
+use crate::core::{BlobHash, Config};
 use crate::services::{Result, SyncError};
 
 pub fn device_root(config: &Config) -> Result<PathBuf> {
@@ -32,35 +31,6 @@ pub fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher.finalize().into()
-}
-
-pub fn insert_tree_change(diff: &mut TreeDiff, path: &Path, change: TreeChange) {
-    let mut components = path.components();
-    if let Some(component) = components.next() {
-        let name = component.as_os_str().to_string_lossy().into_owned();
-        if components.as_path().as_os_str().is_empty() {
-            diff.entries.insert(name, change);
-            return;
-        }
-
-        let entry = diff
-            .entries
-            .entry(name)
-            .or_insert_with(|| TreeChange::Tree(TreeDiff {
-                entries: BTreeMap::new(),
-            }));
-
-        match entry {
-            TreeChange::Tree(child) => insert_tree_change(child, components.as_path(), change),
-            _ => {
-                let mut child = TreeDiff {
-                    entries: BTreeMap::new(),
-                };
-                insert_tree_change(&mut child, components.as_path(), change);
-                *entry = TreeChange::Tree(child);
-            }
-        }
-    }
 }
 
 pub fn encode_hash(hash: &[u8; 32]) -> String {

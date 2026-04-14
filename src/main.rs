@@ -19,12 +19,11 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), slinky::services::SyncError> {
     match cli.command {
         Command::Setup(args) => {
-            let config_path = cli.config.unwrap_or(default_config_path()?);
+            let home_dir = default_home_dir()?;
+            let config_path = cli.config.unwrap_or(home_dir.join("config.toml"));
             let sync_root = match args.sync_root {
                 Some(path) => path,
-                None => std::env::current_dir()
-                    .map_err(slinky::services::SyncError::from)?
-                    .join("sync-root"),
+                None => home_dir.join("sync-root"),
             };
             let config = write_setup_config(&config_path, &sync_root)?;
 
@@ -73,10 +72,14 @@ async fn run(cli: Cli) -> Result<(), slinky::services::SyncError> {
 }
 
 fn default_config_path() -> Result<PathBuf, slinky::services::SyncError> {
+    Ok(default_home_dir()?.join("config.toml"))
+}
+
+fn default_home_dir() -> Result<PathBuf, slinky::services::SyncError> {
     let home = std::env::var("HOME")
         .map(PathBuf::from)
         .map_err(|_| slinky::services::SyncError::InvalidState("HOME is not set".into()))?;
-    Ok(home.join(".slinky").join("config.toml"))
+    Ok(home.join(".slinky"))
 }
 
 fn write_setup_config(config_path: &Path, sync_root: &Path) -> Result<Config, slinky::services::SyncError> {
@@ -93,10 +96,12 @@ fn write_setup_config(config_path: &Path, sync_root: &Path) -> Result<Config, sl
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(config_dir)?;
     std::fs::create_dir_all(sync_root)?;
+    let keys_dir = config_dir.join("keys");
+    std::fs::create_dir_all(&keys_dir)?;
 
     let repo_id = format!("repo-{}", unique_suffix()?);
     let device_id = format!("device-{}", unique_suffix()?);
-    let private_key_path = config_dir.join(format!("{device_id}.key"));
+    let private_key_path = keys_dir.join(format!("{device_id}.key"));
 
     std::fs::write(
         &private_key_path,

@@ -27,11 +27,14 @@ Totally self hosted. Easy setup. No third party managed service.
   - Merkle tree of block, file, folder, commit hashes.
   - Track hashes and parent hashes of commits for history.
   - Common ancestors to identify conflicts.
-  - Frontier vectors: Devices can keep a vector clock of current HEAD hashes of all devices, similar to git branches.
+  - Frontier vectors: Devices can keep a vector clock of current HEAD hashes of all
+    devices, similar to git branches.
   - Use rolling hashes to support small file modifications without rebuilding all blocks.
+  - Devicees share snapshot hash/diffs with coordinator. Hybrid Merkle/journal.
 - Conflict resolution
   - Conflict occurs when two devices edit the same file from the same parent hash.
-  - Fork-and-rename. We do not delete or overwrite. We create copies of files that conflict.
+  - Fork-and-rename. We do not delete or overwrite. We create copies of files that
+    conflict.
   - CRDT style approach. Essentially treat the folder namespace as a CDRT.
 - Garbage collection - delete unreferenced blocks/history.
 
@@ -48,7 +51,7 @@ Totally self hosted. Easy setup. No third party managed service.
 
 - single rust server runs on each device to sync
 - actor/message-passing style concurrency for easy testing (mpsc channels)
-- keep config/metadata in a home folder (~/.slinky)
+- keep config/metadata in a home folder (~/.slinky), likely backed by SQLite on device
 - cleanup stale blocks unless needed for sync. no metadata explosion.
 
 ## Data Model
@@ -73,6 +76,16 @@ Totally self hosted. Easy setup. No third party managed service.
   - device ID
   - timestamp
 
+- ChangeSet
+  - base snapshot hash
+  - target snapshot hash
+  - diff
+
+- TreeDiff
+  - entries
+  - name -> change
+  - `delete | tree | file`
+
 - Tree
   - hash
   - entries
@@ -89,6 +102,9 @@ Totally self hosted. Easy setup. No third party managed service.
   - hash
   - size
 
+- Object
+  - snapshot | tree | file | blob
+
 ## Auth
 
 - Devices identify themselves with public/private key pairs.
@@ -96,6 +112,14 @@ Totally self hosted. Easy setup. No third party managed service.
 - Peers authenticate each other the same way for direct transfer.
 - Repo membership determines which device keys are allowed to sync.
 - Setup should make it easy to add and trust a new device.
+
+## Retention
+
+- Retention should be frontier-based.
+- Devices report the latest frontier they have fully incorporated.
+- Coordinators retain snapshots and referenced objects until no device frontier needs them.
+- Garbage collection should start from retained snapshots and delete only unreachable objects.
+- MVP should keep retention conservative.
 
 ## Conflict Resolution
 
@@ -149,12 +173,13 @@ Totally self hosted. Easy setup. No third party managed service.
 - stage
   - chunk changed files
   - write blobs
+  - build path-level journal
   - rebuild file and tree objects
   - create a staged snapshot
 
 - publish
-  - upload staged objects
-  - publish the snapshot when required objects are available
+  - upload staged metadata and blobs
+  - publish the snapshot and change journal when required objects are available
 
 - notify
   - coordinator pushes update notifications to devices when new snapshots are published
@@ -162,7 +187,8 @@ Totally self hosted. Easy setup. No third party managed service.
 
 - fetch
   - fetch newly announced snapshots
-  - fetch missing objects from storage backends or peers
+  - fetch the change journal for the base/target snapshots the device wants to reconcile
+  - fetch missing blobs from the blob store
 
 - reconcile
   - plan local updates before modifying the filesystem
@@ -183,6 +209,7 @@ Totally self hosted. Easy setup. No third party managed service.
   - watcher
   - startup scanner
   - coalescer
+  - journal builder
   - chunker
   - object store
   - metadata store
@@ -193,8 +220,10 @@ Totally self hosted. Easy setup. No third party managed service.
 
 - Coordinator
   - auth and device registry
+  - obj store
   - repo membership
   - snapshot index
+  - change journal index
   - object availability index
   - peer discovery
   - push notifications

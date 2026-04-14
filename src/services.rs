@@ -1,14 +1,64 @@
+//! Service boundaries for the sync engine.
+//!
+//! These traits define the seams between the serialized engine and the outside world: persistence,
+//! coordinator I/O, filesystem observation, tree construction, reconciliation, and apply.
+
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 
 use crate::core::{
-    Blob, BlobHash, Config, DeviceId, DeviceState, FetchedSnapshot, File, Frontier, PeerState,
-    RepoId, Snapshot, SnapshotAnnouncement, SnapshotHash, StorageBackend, Tree,
+    Blob, BlobHash, ChangeSet, Config, DeviceId, DeviceState, File, Frontier, FullBlob, Object,
+    ObjectId, PeerState, RepoId, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
 };
+use crate::engine::{ApplyJob, BlobTransferJob, BlobTransferResult, StageJob, StageJobResult};
 
 pub type Result<T> = std::result::Result<T, SyncError>;
 
+
+#[async_trait]
+pub trait Coordinator: Send + Sync {
+    /// Ensures the coordinator knows about this device before sync begins.
+    /// Register a device with the coordinator for its repo.
+    async fn register_device(&self, config: &Config) -> Result<()>;
+
+    /// Subscribe to pushed coordinator notifications for a device.
+    async fn subscribe(
+        &self,
+        repo_id: &RepoId,
+        device_id: &DeviceId,
+    ) -> Result<CoordinatorNotificationStream>;
+
+    /// Publish a new snapshot plus its journal diff to the coordinator.
+    async fn publish_snapshot(&self, snapshot: &Snapshot, change_set: &ChangeSet) -> Result<()>;
+
+    /// Fetch snapshot metadata by hash.
+    async fn fetch_snapshot(&self, repo_id: &RepoId, hash: &SnapshotHash) -> Result<Snapshot>;
+
+    /// Fetch the ChangeSet between `base` and`target`.
+    async fn fetch_change_set(
+        &self,
+        repo_id: &RepoId,
+        base: &SnapshotHash,
+        target: &SnapshotHash,
+    ) -> Result<ChangeSet>;
+
+    /// Fetch the latest known device frontier for a repo.
+    async fn fetch_frontier(&self, repo_id: &RepoId) -> Result<Frontier>;
+}
+
+/// Push notification from the coordinator control plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatorNotification {
+    Snapshot(SnapshotAnnouncement),
+    PeerAvailable(PeerState),
+}
+
+pub type CoordinatorNotificationStream = mpsc::Receiver<CoordinatorNotification>;
+
+
+/// Shared sync error type used across local services and runtime workers.
 #[derive(Debug)]
 pub enum SyncError {
     NotFound,
@@ -24,7 +74,8 @@ impl From<std::io::Error> for SyncError {
 }
 
 #[async_trait]
-pub trait MetadataStore: Send + Sync {
+pub trait MetaStore: Send + Sync {
+    /// Loads mutable device-local config and progress state.
     async fn load_config(&self) -> Result<Config>;
     async fn load_state(&self, repo_id: &RepoId, device_id: &DeviceId) -> Result<DeviceState>;
     async fn save_state(
@@ -33,69 +84,67 @@ pub trait MetadataStore: Send + Sync {
         device_id: &DeviceId,
         state: &DeviceState,
     ) -> Result<()>;
-    async fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()>;
-    async fn save_tree(&self, tree: &Tree) -> Result<()>;
-    async fn save_file(&self, file: &File) -> Result<()>;
 }
 
 #[async_trait]
-pub trait ObjectStore: Send + Sync {
-    async fn put_blob(&self, blob: &Blob, bytes: &[u8]) -> Result<()>;
+pub trait ObjStore: Send + Sync {
+    /// Stores immutable sync objects by typed hash.
+    async fn load_object(&self, id: &ObjectId) -> Result<Object>;
+    async fn save_object(&self, object: &Object) -> Result<()>;
+}
+
+/// Stores local blob content for staging, upload, and download completion.
+#[async_trait]
+pub trait BlobStore: Send + Sync {
+    async fn put_blob(&self, blob: &FullBlob) -> Result<()>;
     async fn get_blob(&self, hash: &BlobHash) -> Result<Vec<u8>>;
     async fn has_blob(&self, hash: &BlobHash) -> Result<bool>;
 }
 
-#[async_trait]
-pub trait Coordinator: Send + Sync {
-    async fn register_device(&self, config: &Config) -> Result<()>;
-    async fn publish_snapshot(&self, snapshot: &Snapshot) -> Result<()>;
-    async fn subscribe(&self, repo_id: &RepoId, device_id: &DeviceId)
-    -> Result<NotificationStream>;
-    async fn fetch_snapshot(
-        &self,
-        repo_id: &RepoId,
-        hash: &SnapshotHash,
-    ) -> Result<FetchedSnapshot>;
-    async fn fetch_frontier(&self, repo_id: &RepoId) -> Result<Frontier>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Notification {
-    Snapshot(SnapshotAnnouncement),
-    PeerAvailable(PeerState),
-    // LocalPathsChanged(Vec<PathBuf>),
-}
-
-pub type NotificationStream = Vec<Notification>;
 
 #[async_trait]
 pub trait Scanner: Send + Sync {
+    /// Enumerates files under a local root.
     async fn scan_root(&self, root: &Path) -> Result<Vec<PathBuf>>;
 }
 
 #[async_trait]
 pub trait Watcher: Send + Sync {
-    async fn watch_root(&self, root: &Path) -> Result<NotificationStream>;
+    /// Starts pushing filesystem change events for a root into the engine runtime.
+    async fn start(
+        &self,
+        root: &Path,
+        tx: mpsc::Sender<WatcherEvent>,
+    ) -> Result<()>;
+}
+
+
+/// Filesystem-originated change notifications delivered to the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatcherEvent {
+    PathsChanged(Vec<PathBuf>),
+    RescanRequested,
 }
 
 #[async_trait]
 pub trait Chunker: Send + Sync {
+    /// Splits a file into blob metadata according to the chunking policy.
     async fn chunk_file(&self, path: &Path) -> Result<Vec<Blob>>;
 }
 
 #[async_trait]
-pub trait SnapshotBuilder: Send + Sync {
-    async fn build_snapshot(
-        &self,
-        repo_id: &RepoId,
-        device_id: &DeviceId,
-        changed_paths: &[PathBuf],
-        parent_snapshot: Option<&SnapshotHash>,
-    ) -> Result<StagedSnapshot>;
+pub trait TreeBuilder: Send + Sync {
+    /// Build a complete tree plus referenced immutable objects for a local sync root.
+    ///
+    /// This is the simple full-root/bootstrap path. Implementations may stage blob content in the
+    /// local `BlobStore` while hashing files so bytes do not need to be re-read later. Steady-state
+    /// incremental sync can use a narrower staging path in the future.
+    async fn build_tree(&self, root: &Path) -> Result<StagedTree>;
 }
 
 #[async_trait]
 pub trait Reconciler: Send + Sync {
+    /// Plans the local filesystem changes needed to move toward a remote snapshot.
     async fn plan(
         &self,
         local: Option<&Snapshot>,
@@ -106,22 +155,71 @@ pub trait Reconciler: Send + Sync {
 
 #[async_trait]
 pub trait Applier: Send + Sync {
+    /// Applies a previously reconciled plan to the local filesystem.
     async fn apply(&self, plan: &ApplyPlan) -> Result<()>;
+}
+
+/// Executes stage jobs that read local files and build staged snapshots.
+#[async_trait]
+pub trait StageWorker: Send + Sync {
+    async fn run_stage_job(&self, job: &StageJob) -> Result<StageJobResult>;
+}
+
+/// Executes blob upload/download jobs against remote transfer backends.
+#[async_trait]
+pub trait BlobTransferWorker: Send + Sync {
+    async fn upload_blobs(&self, job: &BlobTransferJob) -> Result<BlobTransferResult>;
+    async fn download_blobs(&self, job: &BlobTransferJob) -> Result<BlobTransferResult>;
+}
+
+/// Executes apply jobs against the local filesystem.
+#[async_trait]
+pub trait ApplyWorker: Send + Sync {
+    async fn run_apply_job(&self, job: &ApplyJob) -> Result<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedTree {
+    /// Root tree for the current local filesystem view.
+    pub root: Tree,
+    /// Additional immutable objects reachable from `root`, excluding the root itself.
+    pub objects: Vec<Object>,
+    /// Blob hashes referenced by the tree and expected to exist in the local blob store.
+    pub blob_hashes: Vec<BlobHash>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedSnapshot {
+    /// Snapshot metadata assembled for the staged tree.
     pub snapshot: Snapshot,
-    pub trees: Vec<Tree>,
-    pub files: Vec<File>,
-    pub blobs: Vec<Blob>,
+    /// Journal diff that describes how the engine believes this snapshot was produced.
+    pub change_set: ChangeSet,
+    /// Fully built tree state referenced by `snapshot.tree_hash`.
+    pub tree: StagedTree,
 }
 
+/// Filesystem operations chosen by reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyPlan {
     pub target_snapshot: SnapshotHash,
-    pub writes: Vec<PathBuf>,
-    pub removes: Vec<PathBuf>,
-    pub conflicts: Vec<PathBuf>,
-    pub source: StorageBackend,
+    pub ops: Vec<ApplyOp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyOp {
+    WriteFile {
+        path: PathBuf,
+        file: File,
+    },
+    CreateDir {
+        path: PathBuf,
+    },
+    RemovePath {
+        path: PathBuf,
+    },
+    MaterializeConflict {
+        original_path: PathBuf,
+        conflict_path: PathBuf,
+        file: File,
+    },
 }

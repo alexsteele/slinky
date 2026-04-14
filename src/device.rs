@@ -10,8 +10,8 @@ use crate::local::{
 };
 use crate::runtime::{RuntimeChannels, SyncService};
 use crate::services::{
-    Applier, BlobStore, Coordinator, MetaStore, ObjStore, Reconciler, Result, Scanner, TreeBuilder,
-    Watcher,
+    Applier, BlobStore, Coordinator, MetaStore, ObjStore, Reconciler, Result, Scanner, StageWorker,
+    TreeBuilder, Watcher,
 };
 
 /// Device is the top-level assembled local node.
@@ -30,12 +30,15 @@ pub struct Device {
 impl Device {
     pub async fn open(config: Config) -> Result<Self> {
         let meta_store = Self::open_meta_store(&config).await?;
+        let state = meta_store
+            .load_state(&config.repo_id, &config.device_id)
+            .await?;
         let obj_store = Self::open_obj_store(&config).await?;
         let blob_store = Self::open_blob_store(&config).await?;
         let coordinator = Self::connect_coordinator(&config).await?;
         let scanner = Self::open_scanner(&config).await?;
         let watcher = Self::open_watcher(&config).await?;
-        let tree_builder = Self::open_tree_builder(blob_store.clone()).await?;
+        let (tree_builder, stage_worker) = Self::open_tree_builder(blob_store.clone()).await?;
         let reconciler = Self::open_reconciler(&config).await?;
         let applier = Self::open_applier(&config).await?;
 
@@ -49,6 +52,8 @@ impl Device {
         let (job_tx, job_rx) = mpsc::channel(crate::runtime::DEFAULT_CHANNEL_CAPACITY);
 
         let engine = SyncEngine::new(
+            config.clone(),
+            state,
             meta_store,
             obj_store,
             blob_store,
@@ -68,7 +73,7 @@ impl Device {
 
         let channels = RuntimeChannels::new(local_change_tx, engine_event_tx, job_rx);
 
-        let service = SyncService::new(engine, channels);
+        let service = SyncService::new(engine, stage_worker, channels);
 
         Ok(Self { config, service })
     }
@@ -120,8 +125,11 @@ impl Device {
 
     async fn open_tree_builder(
         blob_store: Arc<dyn BlobStore>,
-    ) -> Result<Arc<dyn TreeBuilder>> {
-        Ok(Arc::new(LocalTreeBuilder::new(blob_store)))
+    ) -> Result<(Arc<dyn TreeBuilder>, Arc<dyn StageWorker>)> {
+        let worker = Arc::new(LocalTreeBuilder::new(blob_store));
+        let tree_builder: Arc<dyn TreeBuilder> = worker.clone();
+        let stage_worker: Arc<dyn StageWorker> = worker;
+        Ok((tree_builder, stage_worker))
     }
 
     async fn open_reconciler(_config: &Config) -> Result<Arc<dyn Reconciler>> {

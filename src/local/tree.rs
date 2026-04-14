@@ -10,11 +10,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use crate::core::{
-    Blob, BlobHash, File, FileKind, FullBlob, Object, ObjectHash, Tree, TreeEntry,
+    Blob, BlobHash, ChangeSet, File, FileKind, FullBlob, Object, ObjectHash, Tree, TreeChange,
+    TreeDiff, TreeEntry,
 };
 use crate::engine::{StageJob, StageJobResult};
+use crate::local::build_snapshot;
 use crate::local::util::{hash_bytes, walk_files};
-use crate::services::{BlobStore, Result, StageWorker, StagedTree, SyncError, TreeBuilder};
+use crate::services::{BlobStore, Result, StageWorker, StagedSnapshot, StagedTree, SyncError, TreeBuilder};
 
 /// Builds a full local tree view from the configured sync root.
 ///
@@ -81,10 +83,31 @@ impl TreeBuilder for LocalTreeBuilder {
 
 #[async_trait]
 impl StageWorker for LocalTreeBuilder {
-    async fn run_stage_job(&self, _job: &StageJob) -> Result<StageJobResult> {
-        Err(SyncError::InvalidState(
-            "stage worker flow needs an explicit root/subtree plan".into(),
-        ))
+    async fn run_stage_job(&self, job: &StageJob) -> Result<StageJobResult> {
+        let tree = self.build_tree(&job.sync_root).await?;
+        let snapshot = build_snapshot(&job.device_id, tree.root.hash, Some(&job.base));
+        let target = snapshot.hash;
+        let mut diff = TreeDiff {
+            entries: BTreeMap::new(),
+        };
+
+        for object in &tree.objects {
+            if let Object::File(file) = object {
+                diff.insert_path(Path::new(&file.path), TreeChange::File(file.clone()));
+            }
+        }
+
+        Ok(StageJobResult {
+            staged: StagedSnapshot {
+                snapshot,
+                change_set: ChangeSet {
+                    base: job.base,
+                    target,
+                    diff,
+                },
+                tree,
+            },
+        })
     }
 }
 

@@ -3,6 +3,7 @@
 //! The engine owns decisions and state transitions. External runtime tasks feed it events and
 //! execute the jobs it emits.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -23,6 +24,8 @@ use crate::services::{
 /// execute the jobs it returns. This keeps the core sync logic single-threaded and easier to
 /// test, even though hashing, transfer, and apply work may happen concurrently around it.
 pub struct SyncEngine {
+    pub config: Config,
+    pub state: DeviceState,
     pub meta_store: Arc<dyn MetaStore>,
     pub obj_store: Arc<dyn ObjStore>,
     pub blob_store: Arc<dyn BlobStore>,
@@ -81,8 +84,8 @@ pub enum EngineJob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageJob {
     pub device_id: String,
+    pub sync_root: PathBuf,
     pub base: SnapshotHash,
-    pub changed_paths: Vec<std::path::PathBuf>,
 }
 
 /// Result of local staging work.
@@ -123,6 +126,8 @@ pub struct ApplyJob {
 
 impl SyncEngine {
     pub fn new(
+        config: Config,
+        state: DeviceState,
         meta_store: Arc<dyn MetaStore>,
         obj_store: Arc<dyn ObjStore>,
         blob_store: Arc<dyn BlobStore>,
@@ -140,6 +145,8 @@ impl SyncEngine {
         job_tx: mpsc::Sender<EngineJob>,
     ) -> Self {
         Self {
+            config,
+            state,
             meta_store,
             obj_store,
             blob_store,
@@ -159,50 +166,44 @@ impl SyncEngine {
     }
 
     pub async fn load_context(&self) -> Result<(Config, DeviceState)> {
-        let config = self.meta_store.load_config().await?;
-        let state = self
-            .meta_store
-            .load_state(&config.repo_id, &config.device_id)
-            .await?;
-        Ok((config, state))
+        Ok((self.config.clone(), self.state.clone()))
     }
 
     /// Builds and publishes the current local filesystem state as a new snapshot.
-    pub async fn publish_local_snapshot(&self) -> Result<SnapshotHash> {
-        let (config, mut state) = self.load_context().await?;
+    pub async fn publish_local_snapshot(&mut self) -> Result<SnapshotHash> {
+        self.coordinator.register_device(&self.config).await?;
+        let staged = self.build_local_snapshot(self.state.snapshot).await?;
+        self.publish_staged_snapshot(&staged).await
+    }
 
-        self.coordinator.register_device(&config).await?;
-        let staged = self.build_local_snapshot(&config, state.snapshot).await?;
-
-        self.persist_staged_snapshot(&staged).await?;
+    /// Persists and publishes a previously staged snapshot, then advances local device state.
+    pub async fn publish_staged_snapshot(&mut self, staged: &StagedSnapshot) -> Result<SnapshotHash> {
+        self.persist_staged_snapshot(staged).await?;
         self.coordinator
             .publish_snapshot(&staged.snapshot, &staged.change_set)
             .await?;
 
-        state.snapshot = staged.snapshot.hash;
-        state
+        self.state.snapshot = staged.snapshot.hash;
+        self.state
             .frontier
             .device_snapshots
-            .insert(config.device_id.clone(), state.snapshot);
+            .insert(self.config.device_id.clone(), self.state.snapshot);
         self.meta_store
-            .save_state(&config.repo_id, &config.device_id, &state)
+            .save_state(&self.config.repo_id, &self.config.device_id, &self.state)
             .await?;
 
-        Ok(state.snapshot)
+        Ok(self.state.snapshot)
     }
 
     /// Applies one engine event and returns any work that should be scheduled externally.
     pub fn handle_event(&mut self, event: EngineEvent) -> Vec<EngineJob> {
         match event {
             EngineEvent::Startup => {
-                // - load any startup context needed for the main loop
-                // - potentially schedule an initial stage or fetch job
-                Vec::new()
+                self.phase = SyncPhase::Running;
+                vec![EngineJob::Stage(self.make_stage_job())]
             }
             EngineEvent::LocalChange(_change) => {
-                // - coalesce local watcher changes
-                // - schedule a stage job when ready
-                Vec::new()
+                vec![EngineJob::Stage(self.make_stage_job())]
             }
             EngineEvent::RemoteChange(_notification) => {
                 // - decide whether to fetch a newer remote base/target pair
@@ -270,11 +271,10 @@ impl SyncEngine {
     /// Builds a staged snapshot from the current local sync root and previous tip.
     async fn build_local_snapshot(
         &self,
-        config: &Config,
         base_snapshot: SnapshotHash,
     ) -> Result<StagedSnapshot> {
-        let tree = self.tree_builder.build_tree(&config.sync_root).await?;
-        let snapshot = build_snapshot(&config.device_id, tree.root.hash, Some(&base_snapshot));
+        let tree = self.tree_builder.build_tree(&self.config.sync_root).await?;
+        let snapshot = build_snapshot(&self.config.device_id, tree.root.hash, Some(&base_snapshot));
         let mut diff = crate::core::TreeDiff {
             entries: std::collections::BTreeMap::new(),
         };
@@ -297,5 +297,13 @@ impl SyncEngine {
             tree,
             snapshot,
         })
+    }
+
+    fn make_stage_job(&self) -> StageJob {
+        StageJob {
+            device_id: self.config.device_id.clone(),
+            sync_root: self.config.sync_root.clone(),
+            base: self.state.snapshot,
+        }
     }
 }

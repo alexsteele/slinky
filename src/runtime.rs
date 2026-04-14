@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::engine::{EngineEvent, EngineJob, SyncEngine};
-use crate::services::{Result, SyncError, WatcherEvent};
+use crate::services::{Result, StageWorker, SyncError, WatcherEvent};
 
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 
@@ -17,7 +19,7 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 pub struct RuntimeChannels {
     pub local_change_tx: mpsc::Sender<WatcherEvent>,
     pub engine_event_tx: mpsc::Sender<EngineEvent>,
-    pub job_rx: mpsc::Receiver<EngineJob>,
+    pub job_rx: Option<mpsc::Receiver<EngineJob>>,
 }
 
 impl RuntimeChannels {
@@ -29,7 +31,7 @@ impl RuntimeChannels {
         Self {
             local_change_tx,
             engine_event_tx,
-            job_rx,
+            job_rx: Some(job_rx),
         }
     }
 }
@@ -43,6 +45,7 @@ impl RuntimeChannels {
 /// - support `start`, `stop`, and `join`
 pub struct SyncService {
     pub engine: Option<SyncEngine>,
+    pub stage_worker: Arc<dyn StageWorker>,
     pub channels: RuntimeChannels,
     pub shutdown_tx: Option<oneshot::Sender<()>>,
     pub engine_task: Option<JoinHandle<Result<()>>>,
@@ -51,9 +54,14 @@ pub struct SyncService {
 }
 
 impl SyncService {
-    pub fn new(engine: SyncEngine, channels: RuntimeChannels) -> Self {
+    pub fn new(
+        engine: SyncEngine,
+        stage_worker: Arc<dyn StageWorker>,
+        channels: RuntimeChannels,
+    ) -> Self {
         Self {
             engine: Some(engine),
+            stage_worker,
             channels,
             shutdown_tx: None,
             engine_task: None,
@@ -83,6 +91,36 @@ impl SyncService {
 
         self.watcher_task = Some(tokio::spawn(async move {
             watcher.start(&sync_root, local_change_tx).await
+        }));
+
+        let mut job_rx = self
+            .channels
+            .job_rx
+            .take()
+            .ok_or_else(|| SyncError::InvalidState("job receiver is not available".into()))?;
+        let stage_worker = self.stage_worker.clone();
+        let engine_event_tx_for_jobs = self.channels.engine_event_tx.clone();
+        self.worker_tasks.push(tokio::spawn(async move {
+            while let Some(job) = job_rx.recv().await {
+                match job {
+                    EngineJob::Stage(job) => match stage_worker.run_stage_job(&job).await {
+                        Ok(result) => {
+                            engine_event_tx_for_jobs
+                                .send(EngineEvent::StageJobCompleted(result))
+                                .await
+                                .map_err(|_| SyncError::InvalidState("engine event channel closed".into()))?;
+                        }
+                        Err(_) => {
+                            engine_event_tx_for_jobs
+                                .send(EngineEvent::StageJobFailed(job.base))
+                                .await
+                                .map_err(|_| SyncError::InvalidState("engine event channel closed".into()))?;
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            Ok(())
         }));
 
         let engine = self
@@ -128,6 +166,17 @@ impl SyncService {
             }
         }
 
+        for worker_task in self.worker_tasks.drain(..) {
+            match worker_task.await {
+                Ok(result) => result?,
+                Err(join_error) => {
+                    return Err(SyncError::InvalidState(format!(
+                        "worker task failed to join: {join_error}"
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -158,8 +207,8 @@ impl SyncService {
 
             let should_stop = matches!(event, EngineEvent::Shutdown);
 
-            if matches!(event, EngineEvent::Startup | EngineEvent::LocalChange(_)) {
-                engine.publish_local_snapshot().await?;
+            if let EngineEvent::StageJobCompleted(result) = &event {
+                engine.publish_staged_snapshot(&result.staged).await?;
             }
 
             let jobs = engine.handle_event(event);

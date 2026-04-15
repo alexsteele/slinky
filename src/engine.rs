@@ -15,7 +15,8 @@ use crate::core::{
 use crate::local::build_snapshot;
 use crate::local::util::{encode_hash, hash_bytes, walk_files};
 use crate::services::{
-    ApplyPlan, BlobStore, Coordinator, MetaStore, ObjStore, Result, TreeBuilder,
+    ApplyPlan, BlobStore, Coordinator, CoordinatorNotification, MetaStore, ObjStore, Result,
+    TreeBuilder, WatcherEvent,
 };
 
 /// Serialized device-side sync state machine.
@@ -54,6 +55,13 @@ pub struct ApplyJob {
     pub plan: ApplyPlan,
 }
 
+/// Runtime event delivered into the serialized sync engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncEvent {
+    Local(WatcherEvent),
+    Remote(CoordinatorNotification),
+}
+
 impl SyncEngine {
     pub async fn open(
         config: Config,
@@ -87,10 +95,31 @@ impl SyncEngine {
     /// Builds the current local tree and publishes a new snapshot if it changed.
     pub async fn start(&mut self) -> Result<SnapshotHash> {
         self.log("startup sync begin");
-
-        // Make sure the coordinator knows this device before we publish anything.
         self.log("registering device with coordinator");
         self.coordinator.register_device(&self.config).await?;
+        self.full_sync("startup").await
+    }
+
+    /// Applies one runtime sync event.
+    pub async fn handle_event(&mut self, event: SyncEvent) -> Result<Option<SnapshotHash>> {
+        match event {
+            SyncEvent::Local(WatcherEvent::PathsChanged(paths)) => {
+                self.log(&format!("local change detected at {} path(s)", paths.len()));
+                Ok(Some(self.full_sync("local change").await?))
+            }
+            SyncEvent::Local(WatcherEvent::RescanRequested) => {
+                self.log("local rescan requested");
+                Ok(Some(self.full_sync("local rescan").await?))
+            }
+            SyncEvent::Remote(notification) => {
+                self.log(&format!("remote event received: {notification:?}"));
+                Ok(None)
+            }
+        }
+    }
+
+    async fn full_sync(&mut self, reason: &str) -> Result<SnapshotHash> {
+        self.log(&format!("{reason} sync begin"));
 
         // Build the current tree directly from the local sync root.
         self.log("building current tree from sync root");
@@ -99,7 +128,7 @@ impl SyncEngine {
 
         // If the current tree already matches the filesystem, there is nothing to do.
         if self.tree.hash == tree.hash {
-            self.log("startup tree unchanged");
+            self.log(&format!("{reason} tree unchanged"));
             return Ok(self.state.snapshot);
         }
 
@@ -146,7 +175,7 @@ impl SyncEngine {
         self.log("saving updated device state");
         self.save_state().await?;
         self.log(&format!(
-            "startup sync complete {}",
+            "{reason} sync complete {}",
             encode_hash(&snapshot.hash)
         ));
 

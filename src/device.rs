@@ -3,10 +3,11 @@ use std::sync::Arc;
 use crate::core::Config;
 use crate::engine::SyncEngine;
 use crate::local::{
-    LocalBlobStore, LocalMetaStore, LocalObjStore, LocalTreeBuilder, NoopCoordinator, load_config,
+    LocalBlobStore, LocalMetaStore, LocalObjStore, LocalTreeBuilder, NoopCoordinator, NoopWatcher,
+    load_config,
 };
 use crate::runtime::SyncService;
-use crate::services::{BlobStore, Coordinator, MetaStore, ObjStore, Result, TreeBuilder};
+use crate::services::{BlobStore, Coordinator, MetaStore, ObjStore, Result, TreeBuilder, Watcher};
 
 /// Device is the top-level assembled local node.
 ///
@@ -27,6 +28,7 @@ impl Device {
         let obj_store = Self::open_obj_store(&config).await?;
         let coordinator = Self::connect_coordinator(&config).await?;
         let tree_builder = Self::open_tree_builder().await?;
+        let watcher = Self::open_watcher().await?;
 
         let engine = SyncEngine::open(
             config.clone(),
@@ -38,7 +40,7 @@ impl Device {
         )
         .await?;
 
-        let service = SyncService::new(engine);
+        let service = SyncService::new(engine, watcher, config.sync_root.clone());
 
         Ok(Self { config, service })
     }
@@ -83,6 +85,10 @@ impl Device {
     async fn open_tree_builder() -> Result<Arc<dyn TreeBuilder>> {
         Ok(Arc::new(LocalTreeBuilder::new()))
     }
+
+    async fn open_watcher() -> Result<Arc<dyn Watcher>> {
+        Ok(Arc::new(NoopWatcher))
+    }
 }
 
 #[cfg(test)]
@@ -119,18 +125,15 @@ mod tests {
 
         let mut device = Device::open(config.clone()).await.unwrap();
         device.start().await.unwrap();
-        let snapshot_hash = device.service.engine.state.snapshot;
+        device.join().await.unwrap();
+        let engine = device.service.engine.as_ref().unwrap();
+        let snapshot_hash = engine.state.snapshot;
 
         assert_ne!(snapshot_hash, [0; 32]);
-        assert_eq!(device.service.engine.state.snapshot, snapshot_hash);
-        assert_eq!(
-            device.service.engine.tree.hash,
-            device.service.engine.tree.compute_hash()
-        );
+        assert_eq!(engine.state.snapshot, snapshot_hash);
+        assert_eq!(engine.tree.hash, engine.tree.compute_hash());
 
-        let snapshot = match device
-            .service
-            .engine
+        let snapshot = match engine
             .obj_store
             .load_object(&ObjectId::Snapshot(snapshot_hash))
             .await
@@ -139,7 +142,7 @@ mod tests {
             Object::Snapshot(snapshot) => snapshot,
             _ => panic!("expected snapshot object"),
         };
-        assert_eq!(snapshot.tree_hash, device.service.engine.tree.hash);
+        assert_eq!(snapshot.tree_hash, engine.tree.hash);
 
         let blob_hash = hash_bytes(b"hello");
         let blob_path = device_root(&config)

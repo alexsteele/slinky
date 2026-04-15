@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::core::Config;
 use crate::engine::SyncEngine;
 use crate::local::{
-    LocalBlobStore, LocalMetaStore, LocalObjStore, LocalTreeBuilder, NoopCoordinator, NoopWatcher,
+    FsWatcher, LocalBlobStore, LocalMetaStore, LocalObjStore, LocalTreeBuilder, NoopCoordinator,
     load_config,
 };
 use crate::runtime::SyncService;
@@ -87,7 +87,7 @@ impl Device {
     }
 
     async fn open_watcher() -> Result<Arc<dyn Watcher>> {
-        Ok(Arc::new(NoopWatcher))
+        Ok(Arc::new(FsWatcher))
     }
 }
 
@@ -96,9 +96,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::tempdir;
+    use tokio::time::{sleep, Duration};
 
     use super::Device;
-    use crate::core::{Config, DeviceCredentials, Object, ObjectId};
+    use crate::core::{Config, DeviceCredentials, FileKind, Object, ObjectId};
+    use crate::local::{LocalMetaStore};
     use crate::local::util::{device_root, encode_hash, hash_bytes};
 
     #[tokio::test]
@@ -125,6 +127,7 @@ mod tests {
 
         let mut device = Device::open(config.clone()).await.unwrap();
         device.start().await.unwrap();
+        device.stop().await.unwrap();
         device.join().await.unwrap();
         let engine = device.service.engine.as_ref().unwrap();
         let snapshot_hash = engine.state.snapshot;
@@ -151,5 +154,50 @@ mod tests {
             .join(encode_hash(&blob_hash));
         assert!(blob_path.exists());
         assert_eq!(std::fs::read(blob_path).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn device_watcher_updates_engine_tree_after_local_change() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+        std::fs::write(sync_root.join("hello.txt"), b"hello").unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config = Config {
+            sync_root: sync_root.clone(),
+            repo_id: format!("repo-{unique}"),
+            device_id: format!("device-{unique}"),
+            credentials: DeviceCredentials {
+                public_key: "pub".into(),
+                private_key_path: dir.path().join("device.key"),
+            },
+        };
+
+        let mut device = Device::open(config).await.unwrap();
+        device.start().await.unwrap();
+
+        let meta_store = LocalMetaStore::open(device.config.clone()).unwrap();
+        let initial_state = meta_store
+            .load_state(&device.config.repo_id, &device.config.device_id)
+            .await
+            .unwrap();
+
+        std::fs::write(sync_root.join("hello.txt"), b"hello updated").unwrap();
+        sleep(Duration::from_secs(1)).await;
+
+        device.stop().await.unwrap();
+        device.join().await.unwrap();
+
+        let engine = device.service.engine.as_ref().unwrap();
+        assert_ne!(engine.state.snapshot, initial_state.snapshot);
+        assert!(engine
+            .tree
+            .entries
+            .iter()
+            .any(|entry| entry.name == "hello.txt" && entry.kind == FileKind::File));
     }
 }

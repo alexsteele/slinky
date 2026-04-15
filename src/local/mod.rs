@@ -20,5 +20,5 @@ pub use reconciler::NoopReconciler;
 pub use scanner::FsScanner;
 pub use snapshot::build_snapshot;
 pub use tree::LocalTreeBuilder;
-pub use watcher::NoopWatcher;
+pub use watcher::{FsWatcher, NoopWatcher};
 pub use worker::{LocalBlobTransferWorker, NoopApplier};

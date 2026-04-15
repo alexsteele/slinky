@@ -19,6 +19,7 @@ pub struct SyncService {
     pub sync_root: PathBuf,
     started: bool,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    watcher_shutdown_tx: Option<oneshot::Sender<()>>,
     engine_task: Option<JoinHandle<Result<SyncEngine>>>,
     watcher_task: Option<JoinHandle<Result<()>>>,
 }
@@ -31,6 +32,7 @@ impl SyncService {
             sync_root,
             started: false,
             shutdown_tx: None,
+            watcher_shutdown_tx: None,
             engine_task: None,
             watcher_task: None,
         }
@@ -53,10 +55,15 @@ impl SyncService {
         let watcher = self.watcher.clone();
         let sync_root = self.sync_root.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let (watcher_shutdown_tx, watcher_shutdown_rx) = oneshot::channel();
+        let (watcher_ready_tx, watcher_ready_rx) = oneshot::channel();
         self.shutdown_tx = Some(shutdown_tx);
+        self.watcher_shutdown_tx = Some(watcher_shutdown_tx);
 
         self.watcher_task = Some(tokio::spawn(async move {
-            watcher.start(&sync_root, event_tx).await
+            watcher
+                .start(&sync_root, event_tx, watcher_ready_tx, watcher_shutdown_rx)
+                .await
         }));
 
         self.engine_task = Some(tokio::spawn(async move {
@@ -74,6 +81,10 @@ impl SyncService {
             Ok(engine)
         }));
 
+        watcher_ready_rx
+            .await
+            .map_err(|_| SyncError::InvalidState("watcher failed to report readiness".into()))?;
+
         self.started = true;
         Ok(())
     }
@@ -82,6 +93,9 @@ impl SyncService {
         self.started = false;
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
+        }
+        if let Some(watcher_shutdown_tx) = self.watcher_shutdown_tx.take() {
+            let _ = watcher_shutdown_tx.send(());
         }
         Ok(())
     }

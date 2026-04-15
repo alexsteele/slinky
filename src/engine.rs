@@ -94,7 +94,6 @@ impl SyncEngine {
 
     /// Builds the current local tree and publishes a new snapshot if it changed.
     pub async fn start(&mut self) -> Result<SnapshotHash> {
-        self.log("startup sync begin");
         self.log("registering device with coordinator");
         self.coordinator.register_device(&self.config).await?;
         self.full_sync("startup").await

@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::core::{
     Blob, BlobHash, ChangeSet, Config, DeviceId, DeviceState, File, Frontier, FullBlob, Object,
@@ -108,7 +108,16 @@ pub trait Scanner: Send + Sync {
 #[async_trait]
 pub trait Watcher: Send + Sync {
     /// Starts pushing filesystem change events for a root into the engine runtime.
-    async fn start(&self, root: &Path, tx: mpsc::Sender<WatcherEvent>) -> Result<()>;
+    ///
+    /// Send on `ready` after the watch is registered so the runtime can return from startup only
+    /// when local change delivery is live.
+    async fn start(
+        &self,
+        root: &Path,
+        tx: mpsc::Sender<WatcherEvent>,
+        ready: oneshot::Sender<()>,
+        shutdown: oneshot::Receiver<()>,
+    ) -> Result<()>;
 }
 
 /// Filesystem-originated change notifications delivered to the engine.

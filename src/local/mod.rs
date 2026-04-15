@@ -1,4 +1,5 @@
 pub mod blob_store;
+pub mod chunker;
 pub mod config;
 pub mod coordinator;
 pub mod meta_store;
@@ -12,6 +13,7 @@ pub mod watcher;
 pub mod worker;
 
 pub use blob_store::LocalBlobStore;
+pub use chunker::LocalChunker;
 pub use config::load_config;
 pub use coordinator::NoopCoordinator;
 pub use meta_store::LocalMetaStore;

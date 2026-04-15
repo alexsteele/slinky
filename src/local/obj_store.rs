@@ -147,6 +147,10 @@ impl PendingTree {
     }
 
     fn finalize(self) -> (Tree, Vec<Object>) {
+        if self.trees.is_empty() && self.files.is_empty() {
+            return (Tree::empty(), Vec::new());
+        }
+
         let mut entries = Vec::new();
         let mut objects = Vec::new();
 
@@ -224,7 +228,7 @@ mod tests {
         std::fs::write(dir.path().join("docs/readme.md"), b"readme").unwrap();
         std::fs::write(dir.path().join("docs/guides/intro.md"), b"intro").unwrap();
 
-        let builder = LocalTreeBuilder::new();
+        let builder = LocalTreeBuilder::new(crate::local::LocalChunker::open());
         let obj_store = LocalObjStore::open(&Config {
             sync_root: dir.path().to_path_buf(),
             repo_id: format!("repo-{}", dir.path().display()),

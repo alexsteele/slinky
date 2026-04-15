@@ -3,11 +3,14 @@ use std::sync::Arc;
 use crate::core::Config;
 use crate::engine::SyncEngine;
 use crate::local::{
-    FsWatcher, LocalBlobStore, LocalMetaStore, LocalObjStore, LocalTreeBuilder, NoopCoordinator,
+    FsWatcher, LocalBlobStore, LocalChunker, LocalMetaStore, LocalObjStore, LocalTreeBuilder,
+    NoopCoordinator,
     load_config,
 };
 use crate::runtime::SyncService;
-use crate::services::{BlobStore, Coordinator, MetaStore, ObjStore, Result, TreeBuilder, Watcher};
+use crate::services::{
+    BlobStore, Chunker, Coordinator, MetaStore, ObjStore, Result, TreeBuilder, Watcher,
+};
 
 /// Device is the top-level assembled local node.
 ///
@@ -27,7 +30,8 @@ impl Device {
         let blob_store = Self::open_blob_store(&config).await?;
         let obj_store = Self::open_obj_store(&config).await?;
         let coordinator = Self::connect_coordinator(&config).await?;
-        let tree_builder = Self::open_tree_builder().await?;
+        let chunker = Self::open_chunker().await?;
+        let tree_builder = Self::open_tree_builder(chunker.clone()).await?;
         let watcher = Self::open_watcher().await?;
 
         let engine = SyncEngine::open(
@@ -37,6 +41,7 @@ impl Device {
             blob_store,
             coordinator,
             tree_builder,
+            chunker,
         )
         .await?;
 
@@ -82,8 +87,12 @@ impl Device {
         Ok(Arc::new(NoopCoordinator))
     }
 
-    async fn open_tree_builder() -> Result<Arc<dyn TreeBuilder>> {
-        Ok(Arc::new(LocalTreeBuilder::new()))
+    async fn open_chunker() -> Result<Arc<dyn Chunker>> {
+        Ok(LocalChunker::open())
+    }
+
+    async fn open_tree_builder(chunker: Arc<dyn Chunker>) -> Result<Arc<dyn TreeBuilder>> {
+        Ok(Arc::new(LocalTreeBuilder::new(chunker)))
     }
 
     async fn open_watcher() -> Result<Arc<dyn Watcher>> {
@@ -199,5 +208,99 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.name == "hello.txt" && entry.kind == FileKind::File));
+    }
+
+    #[tokio::test]
+    async fn device_watcher_updates_engine_tree_after_local_delete() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        std::fs::write(sync_root.join("docs/guide.md"), b"guide").unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config = Config {
+            sync_root: sync_root.clone(),
+            repo_id: format!("repo-{unique}"),
+            device_id: format!("device-{unique}"),
+            credentials: DeviceCredentials {
+                public_key: "pub".into(),
+                private_key_path: dir.path().join("device.key"),
+            },
+        };
+
+        let mut device = Device::open(config).await.unwrap();
+        device.start().await.unwrap();
+
+        let meta_store = LocalMetaStore::open(device.config.clone()).unwrap();
+        let initial_state = meta_store
+            .load_state(&device.config.repo_id, &device.config.device_id)
+            .await
+            .unwrap();
+
+        std::fs::remove_dir_all(sync_root.join("docs")).unwrap();
+        sleep(Duration::from_secs(1)).await;
+
+        device.stop().await.unwrap();
+        device.join().await.unwrap();
+
+        let engine = device.service.engine.as_ref().unwrap();
+        assert_ne!(engine.state.snapshot, initial_state.snapshot);
+        assert!(engine.tree.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_watcher_updates_engine_tree_after_local_move() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        let from_path = sync_root.join("docs/guide.md");
+        std::fs::write(&from_path, b"guide").unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config = Config {
+            sync_root: sync_root.clone(),
+            repo_id: format!("repo-{unique}"),
+            device_id: format!("device-{unique}"),
+            credentials: DeviceCredentials {
+                public_key: "pub".into(),
+                private_key_path: dir.path().join("device.key"),
+            },
+        };
+
+        let mut device = Device::open(config).await.unwrap();
+        device.start().await.unwrap();
+
+        let meta_store = LocalMetaStore::open(device.config.clone()).unwrap();
+        let initial_state = meta_store
+            .load_state(&device.config.repo_id, &device.config.device_id)
+            .await
+            .unwrap();
+
+        std::fs::create_dir_all(sync_root.join("guides")).unwrap();
+        let to_path = sync_root.join("guides/guide.md");
+        std::fs::rename(&from_path, &to_path).unwrap();
+        sleep(Duration::from_secs(1)).await;
+
+        device.stop().await.unwrap();
+        device.join().await.unwrap();
+
+        let engine = device.service.engine.as_ref().unwrap();
+        assert_ne!(engine.state.snapshot, initial_state.snapshot);
+        assert!(engine
+            .tree
+            .entries
+            .iter()
+            .any(|entry| entry.name == "guides" && entry.kind == FileKind::Folder));
+        assert!(!engine
+            .tree
+            .entries
+            .iter()
+            .any(|entry| entry.name == "docs"));
     }
 }

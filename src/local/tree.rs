@@ -1,21 +1,23 @@
 //! Local tree construction helpers.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Component, Path};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::core::{BlobHash, File, FileKind, Object, ObjectHash, Tree, TreeEntry};
-use crate::local::util::{hash_bytes, walk_files};
-use crate::services::{Result, SyncError, TreeBuilder};
+use crate::core::{File, FileKind, Object, ObjectHash, Tree, TreeEntry};
+use crate::local::util::walk_files;
+use crate::services::{Chunker, Result, SyncError, TreeBuilder};
 
 /// Builds the current root tree for a local sync root.
-pub struct LocalTreeBuilder;
+pub struct LocalTreeBuilder {
+    chunker: Arc<dyn Chunker>,
+}
 
 impl LocalTreeBuilder {
-    pub fn new() -> Self {
-        Self
+    pub fn new(chunker: Arc<dyn Chunker>) -> Self {
+        Self { chunker }
     }
 }
 
@@ -29,12 +31,15 @@ impl TreeBuilder for LocalTreeBuilder {
 
         for path in root_paths {
             let full_path = root_path.join(&path);
-            let data = fs::read(&full_path)?;
-            let blob_hash: BlobHash = hash_bytes(&data);
+            let mut reader = self.chunker.open(&full_path).await?;
+            let mut blobs = Vec::new();
+            while let Some(chunk) = reader.next_chunk().await? {
+                blobs.push(chunk.blob.hash);
+            }
             let mut file = File {
                 path: path.to_string_lossy().into_owned(),
                 hash: [0; 32],
-                blobs: vec![blob_hash],
+                blobs,
             };
             file.update_hash();
             pending_root.insert(&path, file)?;
@@ -75,6 +80,10 @@ impl PendingTree {
 
     /// Materializes immutable tree and file objects bottom-up so each tree hash is stable.
     fn finalize(self) -> (Tree, Vec<Object>) {
+        if self.trees.is_empty() && self.files.is_empty() {
+            return (Tree::empty(), Vec::new());
+        }
+
         let mut entries = Vec::new();
         let mut objects = Vec::new();
 
@@ -132,7 +141,7 @@ mod tests {
         std::fs::write(dir.path().join("alpha.txt"), b"alpha").unwrap();
         std::fs::write(dir.path().join("beta.txt"), b"beta").unwrap();
 
-        let builder = LocalTreeBuilder::new();
+        let builder = LocalTreeBuilder::new(crate::local::LocalChunker::open());
         let tree = builder.build_tree(dir.path()).await.unwrap();
 
         assert_eq!(tree.entries.len(), 2);
@@ -157,7 +166,7 @@ mod tests {
         std::fs::write(dir.path().join("docs/readme.md"), b"readme").unwrap();
         std::fs::write(dir.path().join("docs/guides/intro.md"), b"intro").unwrap();
 
-        let builder = LocalTreeBuilder::new();
+        let builder = LocalTreeBuilder::new(crate::local::LocalChunker::open());
         let tree = builder.build_tree(dir.path()).await.unwrap();
 
         let docs_entry = tree

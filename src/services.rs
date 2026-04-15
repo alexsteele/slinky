@@ -137,10 +137,23 @@ pub enum WatcherEvent {
     RescanRequested,
 }
 
+/// One staged chunk produced by a file chunker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    pub blob: Blob,
+    pub full_blob: FullBlob,
+}
+
+#[async_trait]
+pub trait ChunkReader: Send {
+    /// Returns the next chunk for a file, or `None` once the file is fully consumed.
+    async fn next_chunk(&mut self) -> Result<Option<Chunk>>;
+}
+
 #[async_trait]
 pub trait Chunker: Send + Sync {
-    /// Splits a file into blob metadata according to the chunking policy.
-    async fn chunk_file(&self, path: &Path) -> Result<Vec<Blob>>;
+    /// Opens a streaming chunk reader for a file.
+    async fn open(&self, path: &Path) -> Result<Box<dyn ChunkReader>>;
 }
 
 #[async_trait]

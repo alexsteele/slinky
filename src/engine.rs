@@ -9,15 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::{
-    BlobHash, ChangeSet, Config, DeviceState, File, FullBlob, Object, ObjectId, Snapshot,
-    SnapshotHash, Tree, TreeDiff,
+    BlobHash, ChangeSet, Config, DeviceState, File, Object, ObjectId, Snapshot, SnapshotHash,
+    Tree, TreeDiff,
 };
 use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
-use crate::local::util::{encode_hash, hash_bytes, walk_files};
+use crate::local::util::{encode_hash, walk_files};
 use crate::services::{
-    ApplyPlan, BlobStore, Coordinator, CoordinatorNotification, MetaStore, ObjStore, Result,
-    TreeBuilder, WatcherEvent,
+    ApplyPlan, BlobStore, Chunker, Coordinator, CoordinatorNotification, MetaStore, ObjStore,
+    Result, TreeBuilder, WatcherEvent,
 };
 
 /// Serialized device-side sync state machine.
@@ -35,6 +35,7 @@ pub struct SyncEngine {
     pub blob_store: Arc<dyn BlobStore>,
     pub coordinator: Arc<dyn Coordinator>,
     pub tree_builder: Arc<dyn TreeBuilder>,
+    pub chunker: Arc<dyn Chunker>,
 }
 
 /// Upload or download request for referenced blob content.
@@ -61,7 +62,6 @@ pub struct ApplyJob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileBuild {
     file: File,
-    new_blobs: Vec<FullBlob>,
 }
 
 /// Runtime event delivered into the serialized sync engine.
@@ -79,6 +79,7 @@ impl SyncEngine {
         blob_store: Arc<dyn BlobStore>,
         coordinator: Arc<dyn Coordinator>,
         tree_builder: Arc<dyn TreeBuilder>,
+        chunker: Arc<dyn Chunker>,
     ) -> Result<Self> {
         let state = meta_store
             .load_state(&config.repo_id, &config.device_id)
@@ -99,6 +100,7 @@ impl SyncEngine {
             blob_store,
             coordinator,
             tree_builder,
+            chunker,
         })
     }
 
@@ -286,27 +288,23 @@ impl SyncEngine {
 
     async fn build_file(&self, relative: &Path) -> Result<FileBuild> {
         let full_path = self.config.sync_root.join(relative);
-        // TODO: Don't read whole file/blob.
-        let data = std::fs::read(&full_path)?;
-        let blob_hash = hash_bytes(&data);
-        let mut new_blobs = Vec::new();
-        if !self.blob_store.has_blob(&blob_hash).await? {
-            let blob = FullBlob {
-                hash: blob_hash,
-                size: data.len() as u64,
-                data,
-            };
-            self.blob_store.put_blob(&blob).await?;
-            new_blobs.push(blob);
+        let mut reader = self.chunker.open(&full_path).await?;
+        let mut blobs = Vec::new();
+        while let Some(chunk) = reader.next_chunk().await? {
+            blobs.push(chunk.blob.hash);
+            if self.blob_store.has_blob(&chunk.full_blob.hash).await? {
+                continue;
+            }
+            self.blob_store.put_blob(&chunk.full_blob).await?;
         }
 
         let mut file = File {
             path: relative.to_string_lossy().into_owned(),
             hash: [0; 32],
-            blobs: vec![blob_hash],
+            blobs,
         };
         file.update_hash();
-        Ok(FileBuild { file, new_blobs })
+        Ok(FileBuild { file })
     }
 
     async fn build_index_from_disk(&self) -> Result<TreeIndex> {
@@ -445,7 +443,7 @@ mod tests {
         ChangeSet, Config, DeviceCredentials, DeviceState, File, FileKind, Frontier, FullBlob,
         Object, ObjectHash, ObjectId, Snapshot, SnapshotHash, Tree, TreeEntry,
     };
-    use crate::local::build_snapshot;
+    use crate::local::{LocalChunker, build_snapshot};
     use crate::local::util::hash_bytes;
     use crate::services::{
         BlobStore, Coordinator, CoordinatorNotificationStream, MetaStore, ObjStore, Result,
@@ -672,6 +670,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree: tree.clone() });
+        let chunker = LocalChunker::open();
 
         let mut engine = SyncEngine::open(
             config,
@@ -680,6 +679,7 @@ mod tests {
             blob_store.clone(),
             coordinator.clone(),
             tree_builder,
+            chunker,
         )
         .await
         .unwrap();
@@ -724,6 +724,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree: tree.clone() });
+        let chunker = LocalChunker::open();
 
         let mut engine = SyncEngine::open(
             config,
@@ -732,6 +733,7 @@ mod tests {
             blob_store,
             coordinator.clone(),
             tree_builder,
+            chunker,
         )
         .await
         .unwrap();
@@ -761,6 +763,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(tree.clone()));
+        let chunker = LocalChunker::open();
 
         let mut engine = SyncEngine::open(
             config,
@@ -769,6 +772,7 @@ mod tests {
             blob_store,
             coordinator,
             tree_builder.clone(),
+            chunker,
         )
         .await
         .unwrap();
@@ -815,6 +819,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(root_tree.clone()));
+        let chunker = LocalChunker::open();
 
         let mut engine = SyncEngine::open(
             config,
@@ -823,6 +828,7 @@ mod tests {
             blob_store,
             coordinator,
             tree_builder.clone(),
+            chunker,
         )
         .await
         .unwrap();
@@ -865,6 +871,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(root_tree.clone()));
+        let chunker = LocalChunker::open();
 
         let mut engine = SyncEngine::open(
             config,
@@ -873,6 +880,7 @@ mod tests {
             blob_store.clone(),
             coordinator,
             tree_builder.clone(),
+            chunker,
         )
         .await
         .unwrap();

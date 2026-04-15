@@ -123,7 +123,17 @@ pub trait Watcher: Send + Sync {
 /// Filesystem-originated change notifications delivered to the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatcherEvent {
-    PathsChanged(Vec<PathBuf>),
+    /// File content or metadata changed, or a new file appeared.
+    FileChanged(PathBuf),
+    /// A file disappeared from the watched root.
+    FileDeleted(PathBuf),
+    /// A directory appeared under the watched root.
+    DirectoryCreated(PathBuf),
+    /// A directory disappeared from the watched root.
+    DirectoryDeleted(PathBuf),
+    /// A path moved within the watched root.
+    PathMoved { from: PathBuf, to: PathBuf },
+    /// The watcher lost enough fidelity that the engine should rebuild from disk.
     RescanRequested,
 }
 

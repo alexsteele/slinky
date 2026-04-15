@@ -102,8 +102,28 @@ impl SyncEngine {
     /// Applies one runtime sync event.
     pub async fn handle_event(&mut self, event: SyncEvent) -> Result<Option<SnapshotHash>> {
         match event {
-            SyncEvent::Local(WatcherEvent::PathsChanged(paths)) => {
-                self.log(&format!("local change detected at {} path(s)", paths.len()));
+            SyncEvent::Local(WatcherEvent::FileChanged(path)) => {
+                self.log(&format!("local file changed: {}", path.display()));
+                Ok(Some(self.full_sync("local change").await?))
+            }
+            SyncEvent::Local(WatcherEvent::FileDeleted(path)) => {
+                self.log(&format!("local file deleted: {}", path.display()));
+                Ok(Some(self.full_sync("local change").await?))
+            }
+            SyncEvent::Local(WatcherEvent::DirectoryCreated(path)) => {
+                self.log(&format!("local directory created: {}", path.display()));
+                Ok(Some(self.full_sync("local change").await?))
+            }
+            SyncEvent::Local(WatcherEvent::DirectoryDeleted(path)) => {
+                self.log(&format!("local directory deleted: {}", path.display()));
+                Ok(Some(self.full_sync("local change").await?))
+            }
+            SyncEvent::Local(WatcherEvent::PathMoved { from, to }) => {
+                self.log(&format!(
+                    "local path moved: {} -> {}",
+                    from.display(),
+                    to.display()
+                ));
                 Ok(Some(self.full_sync("local change").await?))
             }
             SyncEvent::Local(WatcherEvent::RescanRequested) => {

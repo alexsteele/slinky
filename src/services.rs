@@ -12,10 +12,9 @@ use crate::core::{
     Blob, BlobHash, ChangeSet, Config, DeviceId, DeviceState, File, Frontier, FullBlob, Object,
     ObjectId, PeerState, RepoId, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
 };
-use crate::engine::{ApplyJob, BlobTransferJob, BlobTransferResult, StageJob, StageJobResult};
+use crate::engine::{ApplyJob, BlobTransferJob, BlobTransferResult};
 
 pub type Result<T> = std::result::Result<T, SyncError>;
-
 
 #[async_trait]
 pub trait Coordinator: Send + Sync {
@@ -56,7 +55,6 @@ pub enum CoordinatorNotification {
 }
 
 pub type CoordinatorNotificationStream = mpsc::Receiver<CoordinatorNotification>;
-
 
 /// Shared sync error type used across local services and runtime workers.
 #[derive(Debug)]
@@ -101,7 +99,6 @@ pub trait BlobStore: Send + Sync {
     async fn has_blob(&self, hash: &BlobHash) -> Result<bool>;
 }
 
-
 #[async_trait]
 pub trait Scanner: Send + Sync {
     /// Enumerates files under a local root.
@@ -111,13 +108,8 @@ pub trait Scanner: Send + Sync {
 #[async_trait]
 pub trait Watcher: Send + Sync {
     /// Starts pushing filesystem change events for a root into the engine runtime.
-    async fn start(
-        &self,
-        root: &Path,
-        tx: mpsc::Sender<WatcherEvent>,
-    ) -> Result<()>;
+    async fn start(&self, root: &Path, tx: mpsc::Sender<WatcherEvent>) -> Result<()>;
 }
-
 
 /// Filesystem-originated change notifications delivered to the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,12 +126,11 @@ pub trait Chunker: Send + Sync {
 
 #[async_trait]
 pub trait TreeBuilder: Send + Sync {
-    /// Build a complete tree plus referenced immutable objects for a local sync root.
+    /// Build the current root tree for a local sync root.
     ///
-    /// This is the simple full-root/bootstrap path. Implementations may stage blob content in the
-    /// local `BlobStore` while hashing files so bytes do not need to be re-read later. Steady-state
-    /// incremental sync can use a narrower staging path in the future.
-    async fn build_tree(&self, root: &Path) -> Result<StagedTree>;
+    /// This is the simple full-root/bootstrap path. Persistence is kept separate so the engine can
+    /// decide when to save the resulting immutable objects.
+    async fn build_tree(&self, root: &Path) -> Result<Tree>;
 }
 
 #[async_trait]
@@ -159,12 +150,6 @@ pub trait Applier: Send + Sync {
     async fn apply(&self, plan: &ApplyPlan) -> Result<()>;
 }
 
-/// Executes stage jobs that read local files and build staged snapshots.
-#[async_trait]
-pub trait StageWorker: Send + Sync {
-    async fn run_stage_job(&self, job: &StageJob) -> Result<StageJobResult>;
-}
-
 /// Executes blob upload/download jobs against remote transfer backends.
 #[async_trait]
 pub trait BlobTransferWorker: Send + Sync {
@@ -176,26 +161,6 @@ pub trait BlobTransferWorker: Send + Sync {
 #[async_trait]
 pub trait ApplyWorker: Send + Sync {
     async fn run_apply_job(&self, job: &ApplyJob) -> Result<()>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedTree {
-    /// Root tree for the current local filesystem view.
-    pub root: Tree,
-    /// Additional immutable objects reachable from `root`, excluding the root itself.
-    pub objects: Vec<Object>,
-    /// Blob hashes referenced by the tree and expected to exist in the local blob store.
-    pub blob_hashes: Vec<BlobHash>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedSnapshot {
-    /// Snapshot metadata assembled for the staged tree.
-    pub snapshot: Snapshot,
-    /// Journal diff that describes how the engine believes this snapshot was produced.
-    pub change_set: ChangeSet,
-    /// Fully built tree state referenced by `snapshot.tree_hash`.
-    pub tree: StagedTree,
 }
 
 /// Filesystem operations chosen by reconciliation.

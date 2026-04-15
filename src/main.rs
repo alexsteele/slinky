@@ -82,7 +82,10 @@ fn default_home_dir() -> Result<PathBuf, slinky::services::SyncError> {
     Ok(home.join(".slinky"))
 }
 
-fn write_setup_config(config_path: &Path, sync_root: &Path) -> Result<Config, slinky::services::SyncError> {
+fn write_setup_config(
+    config_path: &Path,
+    sync_root: &Path,
+) -> Result<Config, slinky::services::SyncError> {
     if config_path.exists() {
         return Err(slinky::services::SyncError::InvalidState(format!(
             "config already exists at {}",

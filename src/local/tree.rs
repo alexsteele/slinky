@@ -1,43 +1,27 @@
 //! Local tree construction helpers.
-//!
-//! This module turns a local sync root into immutable tree/file/blob metadata. The tree builder
-//! here is intentionally the simple full-root path used for bootstrap and rebuild flows.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path};
-use std::sync::Arc;
 
 use async_trait::async_trait;
-use crate::core::{
-    Blob, BlobHash, ChangeSet, File, FileKind, FullBlob, Object, ObjectHash, Tree, TreeChange,
-    TreeDiff, TreeEntry,
-};
-use crate::engine::{StageJob, StageJobResult};
-use crate::local::build_snapshot;
-use crate::local::util::{hash_bytes, walk_files};
-use crate::services::{BlobStore, Result, StageWorker, StagedSnapshot, StagedTree, SyncError, TreeBuilder};
 
-/// Builds a full local tree view from the configured sync root.
-///
-/// As each file is read and hashed, blob bytes are staged into the local blob store so later
-/// upload work can run by hash. This favors a simple bootstrap path; incremental steady-state
-/// staging can be introduced separately.
-pub struct LocalTreeBuilder {
-    blob_store: Arc<dyn BlobStore>,
-}
+use crate::core::{BlobHash, File, FileKind, Object, ObjectHash, Tree, TreeEntry};
+use crate::local::util::{hash_bytes, walk_files};
+use crate::services::{Result, SyncError, TreeBuilder};
+
+/// Builds the current root tree for a local sync root.
+pub struct LocalTreeBuilder;
 
 impl LocalTreeBuilder {
-    pub fn new(blob_store: Arc<dyn BlobStore>) -> Self {
-        Self { blob_store }
+    pub fn new() -> Self {
+        Self
     }
 }
 
 #[async_trait]
 impl TreeBuilder for LocalTreeBuilder {
-    async fn build_tree(&self, root_path: &Path) -> Result<StagedTree> {
-        let mut objects = Vec::new();
-        let mut blob_hashes = Vec::new();
+    async fn build_tree(&self, root_path: &Path) -> Result<Tree> {
         let mut root_paths = Vec::new();
         let mut pending_root = PendingTree::default();
 
@@ -53,61 +37,11 @@ impl TreeBuilder for LocalTreeBuilder {
                 blobs: vec![blob_hash],
             };
             file.update_hash();
-            let blob = Blob {
-                hash: blob_hash,
-                size: data.len() as u64,
-            };
-            self.blob_store
-                .put_blob(&FullBlob {
-                    hash: blob_hash,
-                    size: data.len() as u64,
-                    data,
-                })
-                .await?;
-
-            blob_hashes.push(blob_hash);
-            objects.push(Object::Blob(blob));
             pending_root.insert(&path, file)?;
         }
 
-        let (root, mut tree_objects) = pending_root.finalize();
-        objects.append(&mut tree_objects);
-
-        Ok(StagedTree {
-            root,
-            objects,
-            blob_hashes,
-        })
-    }
-}
-
-#[async_trait]
-impl StageWorker for LocalTreeBuilder {
-    async fn run_stage_job(&self, job: &StageJob) -> Result<StageJobResult> {
-        let tree = self.build_tree(&job.sync_root).await?;
-        let snapshot = build_snapshot(&job.device_id, tree.root.hash, Some(&job.base));
-        let target = snapshot.hash;
-        let mut diff = TreeDiff {
-            entries: BTreeMap::new(),
-        };
-
-        for object in &tree.objects {
-            if let Object::File(file) = object {
-                diff.insert_path(Path::new(&file.path), TreeChange::File(file.clone()));
-            }
-        }
-
-        Ok(StageJobResult {
-            staged: StagedSnapshot {
-                snapshot,
-                change_set: ChangeSet {
-                    base: job.base,
-                    target,
-                    diff,
-                },
-                tree,
-            },
-        })
+        let (root, _objects) = pending_root.finalize();
+        Ok(root)
     }
 }
 
@@ -186,47 +120,11 @@ fn component_name(component: Component<'_>) -> Result<String> {
 mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    use async_trait::async_trait;
     use tempfile::tempdir;
 
     use super::LocalTreeBuilder;
-    use crate::core::{BlobHash, FileKind, FullBlob, Object, ObjectHash};
-    use crate::services::{BlobStore, Result, TreeBuilder};
-
-    struct MemoryBlobStore {
-        blobs: Mutex<std::collections::BTreeMap<BlobHash, Vec<u8>>>,
-    }
-
-    impl MemoryBlobStore {
-        fn new() -> Self {
-            Self {
-                blobs: Mutex::new(std::collections::BTreeMap::new()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl BlobStore for MemoryBlobStore {
-        async fn put_blob(&self, blob: &FullBlob) -> Result<()> {
-            self.blobs.lock().unwrap().insert(blob.hash, blob.data.clone());
-            Ok(())
-        }
-
-        async fn get_blob(&self, hash: &BlobHash) -> Result<Vec<u8>> {
-            self.blobs
-                .lock()
-                .unwrap()
-                .get(hash)
-                .cloned()
-                .ok_or(crate::services::SyncError::NotFound)
-        }
-
-        async fn has_blob(&self, hash: &BlobHash) -> Result<bool> {
-            Ok(self.blobs.lock().unwrap().contains_key(hash))
-        }
-    }
+    use crate::core::FileKind;
+    use crate::services::TreeBuilder;
 
     #[tokio::test]
     async fn builds_tree_for_flat_root() {
@@ -234,82 +132,40 @@ mod tests {
         std::fs::write(dir.path().join("alpha.txt"), b"alpha").unwrap();
         std::fs::write(dir.path().join("beta.txt"), b"beta").unwrap();
 
-        let builder = LocalTreeBuilder::new(std::sync::Arc::new(MemoryBlobStore::new()));
-        let staged = builder.build_tree(dir.path()).await.unwrap();
+        let builder = LocalTreeBuilder::new();
+        let tree = builder.build_tree(dir.path()).await.unwrap();
 
-        assert_eq!(staged.root.entries.len(), 2);
-        assert_eq!(staged.blob_hashes.len(), 2);
+        assert_eq!(tree.entries.len(), 2);
 
-        let names = staged
-            .root
+        let names = tree
             .entries
             .iter()
             .map(|entry| entry.name.as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(names, BTreeSet::from(["alpha.txt", "beta.txt"]));
-        assert!(staged
-            .root
-            .entries
-            .iter()
-            .all(|entry| entry.kind == FileKind::File));
-
-        let file_paths = staged
-            .objects
-            .iter()
-            .filter_map(|object| match object {
-                Object::File(file) => Some(file.path.as_str()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(file_paths, BTreeSet::from(["alpha.txt", "beta.txt"]));
+        assert!(
+            tree.entries
+                .iter()
+                .all(|entry| entry.kind == FileKind::File)
+        );
     }
 
     #[tokio::test]
-    async fn builds_nested_tree_and_stages_blob_content() {
+    async fn builds_nested_tree() {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("docs/guides")).unwrap();
         std::fs::write(dir.path().join("docs/readme.md"), b"readme").unwrap();
         std::fs::write(dir.path().join("docs/guides/intro.md"), b"intro").unwrap();
 
-        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
-        let builder = LocalTreeBuilder::new(blob_store.clone());
-        let staged = builder.build_tree(dir.path()).await.unwrap();
+        let builder = LocalTreeBuilder::new();
+        let tree = builder.build_tree(dir.path()).await.unwrap();
 
-        assert_eq!(staged.blob_hashes.len(), 2);
-
-        let docs_entry = staged
-            .root
+        let docs_entry = tree
             .entries
             .iter()
             .find(|entry| entry.name == "docs")
             .unwrap();
         assert_eq!(docs_entry.kind, FileKind::Folder);
-
-        let docs_tree_hash = match docs_entry.hash {
-            ObjectHash::Tree(hash) => hash,
-            ObjectHash::File(_) => panic!("expected docs to be a tree"),
-        };
-
-        let docs_tree = staged
-            .objects
-            .iter()
-            .find_map(|object| match object {
-                Object::Tree(tree) if tree.hash == docs_tree_hash => Some(tree),
-                _ => None,
-            })
-            .unwrap();
-
-        let docs_names = docs_tree
-            .entries
-            .iter()
-            .map(|entry| entry.name.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(docs_names, BTreeSet::from(["guides", "readme.md"]));
-
-        for hash in &staged.blob_hashes {
-            assert!(blob_store.has_blob(hash).await.unwrap());
-            assert!(!blob_store.get_blob(hash).await.unwrap().is_empty());
-        }
     }
 
     #[allow(dead_code)]

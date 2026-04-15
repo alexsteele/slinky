@@ -1,25 +1,18 @@
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-
 use crate::core::Config;
-use crate::engine::{SyncEngine, SyncPhase};
+use crate::engine::SyncEngine;
 use crate::local::{
-    FsScanner, LocalBlobStore, LocalMetaStore, LocalObjStore, LocalTreeBuilder, NoopApplier,
-    NoopCoordinator, NoopReconciler, NoopWatcher, load_config,
+    LocalBlobStore, LocalMetaStore, LocalObjStore, LocalTreeBuilder, NoopCoordinator, load_config,
 };
-use crate::runtime::{RuntimeChannels, SyncService};
-use crate::services::{
-    Applier, BlobStore, Coordinator, MetaStore, ObjStore, Reconciler, Result, Scanner, StageWorker,
-    TreeBuilder, Watcher,
-};
+use crate::runtime::SyncService;
+use crate::services::{BlobStore, Coordinator, MetaStore, ObjStore, Result, TreeBuilder};
 
 /// Device is the top-level assembled local node.
 ///
 /// Responsibilities:
 /// - own the local device config
 /// - connect to the coordinator using that config
-/// - assemble runtime channels
 /// - construct the serialized sync engine
 /// - expose the sync service lifecycle
 pub struct Device {
@@ -30,50 +23,22 @@ pub struct Device {
 impl Device {
     pub async fn open(config: Config) -> Result<Self> {
         let meta_store = Self::open_meta_store(&config).await?;
-        let state = meta_store
-            .load_state(&config.repo_id, &config.device_id)
-            .await?;
-        let obj_store = Self::open_obj_store(&config).await?;
         let blob_store = Self::open_blob_store(&config).await?;
+        let obj_store = Self::open_obj_store(&config).await?;
         let coordinator = Self::connect_coordinator(&config).await?;
-        let scanner = Self::open_scanner(&config).await?;
-        let watcher = Self::open_watcher(&config).await?;
-        let (tree_builder, stage_worker) = Self::open_tree_builder(blob_store.clone()).await?;
-        let reconciler = Self::open_reconciler(&config).await?;
-        let applier = Self::open_applier(&config).await?;
+        let tree_builder = Self::open_tree_builder().await?;
 
-        let coordinator_notifications = coordinator
-            .subscribe(&config.repo_id, &config.device_id)
-            .await?;
-        let (local_change_tx, local_change_rx) =
-            mpsc::channel(crate::runtime::DEFAULT_CHANNEL_CAPACITY);
-        let (engine_event_tx, engine_event_rx) =
-            mpsc::channel(crate::runtime::DEFAULT_CHANNEL_CAPACITY);
-        let (job_tx, job_rx) = mpsc::channel(crate::runtime::DEFAULT_CHANNEL_CAPACITY);
-
-        let engine = SyncEngine::new(
+        let engine = SyncEngine::open(
             config.clone(),
-            state,
             meta_store,
             obj_store,
             blob_store,
             coordinator,
-            scanner,
-            watcher,
             tree_builder,
-            reconciler,
-            applier,
-            SyncPhase::Starting,
-            None,
-            coordinator_notifications,
-            local_change_rx,
-            engine_event_rx,
-            job_tx,
-        );
+        )
+        .await?;
 
-        let channels = RuntimeChannels::new(local_change_tx, engine_event_tx, job_rx);
-
-        let service = SyncService::new(engine, stage_worker, channels);
+        let service = SyncService::new(engine);
 
         Ok(Self { config, service })
     }
@@ -115,28 +80,73 @@ impl Device {
         Ok(Arc::new(NoopCoordinator))
     }
 
-    async fn open_scanner(_config: &Config) -> Result<Arc<dyn Scanner>> {
-        Ok(Arc::new(FsScanner))
+    async fn open_tree_builder() -> Result<Arc<dyn TreeBuilder>> {
+        Ok(Arc::new(LocalTreeBuilder::new()))
     }
+}
 
-    async fn open_watcher(_config: &Config) -> Result<Arc<dyn Watcher>> {
-        Ok(Arc::new(NoopWatcher))
-    }
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    async fn open_tree_builder(
-        blob_store: Arc<dyn BlobStore>,
-    ) -> Result<(Arc<dyn TreeBuilder>, Arc<dyn StageWorker>)> {
-        let worker = Arc::new(LocalTreeBuilder::new(blob_store));
-        let tree_builder: Arc<dyn TreeBuilder> = worker.clone();
-        let stage_worker: Arc<dyn StageWorker> = worker;
-        Ok((tree_builder, stage_worker))
-    }
+    use tempfile::tempdir;
 
-    async fn open_reconciler(_config: &Config) -> Result<Arc<dyn Reconciler>> {
-        Ok(Arc::new(NoopReconciler))
-    }
+    use super::Device;
+    use crate::core::{Config, DeviceCredentials, Object, ObjectId};
+    use crate::local::util::{device_root, encode_hash, hash_bytes};
 
-    async fn open_applier(_config: &Config) -> Result<Arc<dyn Applier>> {
-        Ok(Arc::new(NoopApplier))
+    #[tokio::test]
+    async fn device_start_persists_snapshot_tree_and_blob() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+        let file_path = sync_root.join("hello.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config = Config {
+            sync_root: sync_root.clone(),
+            repo_id: format!("repo-{unique}"),
+            device_id: format!("device-{unique}"),
+            credentials: DeviceCredentials {
+                public_key: "pub".into(),
+                private_key_path: dir.path().join("device.key"),
+            },
+        };
+
+        let mut device = Device::open(config.clone()).await.unwrap();
+        device.start().await.unwrap();
+        let snapshot_hash = device.service.engine.state.snapshot;
+
+        assert_ne!(snapshot_hash, [0; 32]);
+        assert_eq!(device.service.engine.state.snapshot, snapshot_hash);
+        assert_eq!(
+            device.service.engine.tree.hash,
+            device.service.engine.tree.compute_hash()
+        );
+
+        let snapshot = match device
+            .service
+            .engine
+            .obj_store
+            .load_object(&ObjectId::Snapshot(snapshot_hash))
+            .await
+            .unwrap()
+        {
+            Object::Snapshot(snapshot) => snapshot,
+            _ => panic!("expected snapshot object"),
+        };
+        assert_eq!(snapshot.tree_hash, device.service.engine.tree.hash);
+
+        let blob_hash = hash_bytes(b"hello");
+        let blob_path = device_root(&config)
+            .unwrap()
+            .join("blobs")
+            .join(encode_hash(&blob_hash));
+        assert!(blob_path.exists());
+        assert_eq!(std::fs::read(blob_path).unwrap(), b"hello");
     }
 }

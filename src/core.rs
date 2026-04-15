@@ -32,13 +32,13 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceState {
     pub snapshot: SnapshotHash,
+    pub published_snapshot: SnapshotHash,
     pub frontier: Frontier,
     // TODO: Do we need these?
     // pub transfers: Vec<PendingTransfer>,
     // pub conflicts: Vec<ConflictRecord>,
     // pub tombstones: Vec<Tombstone>,
 }
-
 
 /// A peer's advertised tip snapshot within the repo frontier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +53,6 @@ pub struct DeviceCredentials {
     pub public_key: String,
     pub private_key_path: PathBuf,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageBackend {
@@ -146,12 +145,11 @@ impl TreeDiff {
                 return;
             }
 
-            let entry = self
-                .entries
-                .entry(name)
-                .or_insert_with(|| TreeChange::Tree(TreeDiff {
+            let entry = self.entries.entry(name).or_insert_with(|| {
+                TreeChange::Tree(TreeDiff {
                     entries: BTreeMap::new(),
-                }));
+                })
+            });
 
             match entry {
                 TreeChange::Tree(child) => child.insert_path(components.as_path(), change),
@@ -183,6 +181,14 @@ pub struct Tree {
 }
 
 impl Tree {
+    /// Returns an empty root tree.
+    pub fn empty() -> Self {
+        Self {
+            hash: [0; 32],
+            entries: Vec::new(),
+        }
+    }
+
     /// Computes the canonical tree hash from its ordered entries.
     pub fn compute_hash(&self) -> TreeHash {
         let mut hasher = Sha256Hasher::new();
@@ -212,10 +218,7 @@ impl Tree {
     ///
     /// The trees themselves only store child hashes, so callers provide the resolved file maps
     /// for the previous and current roots.
-    pub fn diff(
-        previous: &BTreeMap<String, File>,
-        current: &BTreeMap<String, File>,
-    ) -> TreeDiff {
+    pub fn diff(previous: &BTreeMap<String, File>, current: &BTreeMap<String, File>) -> TreeDiff {
         let mut diff = TreeDiff {
             entries: BTreeMap::new(),
         };
@@ -245,13 +248,11 @@ pub struct TreeEntry {
     pub hash: ObjectHash,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileKind {
     Folder,
     File,
 }
-
 
 /// Typed hash reference stored inside tree entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,7 +260,6 @@ pub enum ObjectHash {
     Tree(TreeHash),
     File(FileHash),
 }
-
 
 /// Immutable file metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

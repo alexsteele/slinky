@@ -5,13 +5,14 @@
 //! top later without changing the core startup flow.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::{
-    BlobHash, ChangeSet, Config, DeviceState, File, FileKind, FullBlob, Object, ObjectHash,
-    ObjectId, Snapshot, SnapshotHash, Tree, TreeDiff, TreeEntry,
+    BlobHash, ChangeSet, Config, DeviceState, File, FullBlob, Object, ObjectId, Snapshot,
+    SnapshotHash, Tree, TreeDiff,
 };
+use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
 use crate::local::util::{encode_hash, hash_bytes, walk_files};
 use crate::services::{
@@ -28,6 +29,7 @@ pub struct SyncEngine {
     pub config: Config,
     pub state: DeviceState,
     pub tree: Tree,
+    pub index: TreeIndex,
     pub meta_store: Arc<dyn MetaStore>,
     pub obj_store: Arc<dyn ObjStore>,
     pub blob_store: Arc<dyn BlobStore>,
@@ -84,6 +86,7 @@ impl SyncEngine {
             config,
             state,
             tree: current_tree,
+            index: TreeIndex::empty(),
             meta_store,
             obj_store,
             blob_store,
@@ -124,7 +127,7 @@ impl SyncEngine {
                     from.display(),
                     to.display()
                 ));
-                Ok(Some(self.full_sync("local change").await?))
+                self.sync_moved_path(&from, &to).await.map(Some)
             }
             SyncEvent::Local(WatcherEvent::RescanRequested) => {
                 self.log("local rescan requested");
@@ -144,11 +147,22 @@ impl SyncEngine {
         self.log("building current tree from sync root");
         let tree = self.tree_builder.build_tree(&self.config.sync_root).await?;
         self.log(&format!("built tree {}", encode_hash(&tree.hash)));
-        self.publish_tree(reason, tree).await
+        let index = self.build_index_from_disk().await?;
+        if self.tree.hash == tree.hash {
+            self.tree = tree;
+            self.index = index;
+            self.log(&format!("{reason} tree unchanged"));
+            return Ok(self.state.snapshot);
+        }
+
+        self.index = index;
+        let update = self.index.materialize_all()?;
+        self.publish_update(reason, update).await
     }
 
-    /// Publishes a tree if it changed from the current in-memory root.
-    async fn publish_tree(&mut self, reason: &str, tree: Tree) -> Result<SnapshotHash> {
+    /// Publishes a tree update if it changed from the current in-memory root.
+    async fn publish_update(&mut self, reason: &str, update: TreeUpdate) -> Result<SnapshotHash> {
+        let tree = update.root.clone();
         if self.tree.hash == tree.hash {
             self.log(&format!("{reason} tree unchanged"));
             return Ok(self.state.snapshot);
@@ -165,6 +179,11 @@ impl SyncEngine {
 
         // Persist the immutable objects locally before advertising the new snapshot.
         self.log("saving tree metadata to object db");
+        for file in &update.files {
+            self.obj_store
+                .save_object(&Object::File(file.clone()))
+                .await?;
+        }
         self.obj_store
             .save_object(&Object::Tree(tree.clone()))
             .await?;
@@ -213,8 +232,8 @@ impl SyncEngine {
         }
 
         let file = self.build_file_metadata(&relative).await?;
-        let updated = self.upsert_file_into_tree(&self.tree, &relative, &file).await?;
-        self.publish_tree("local change", updated).await
+        let update = self.index.upsert_file(&relative, file)?;
+        self.publish_update("local change", update).await
     }
 
     async fn sync_removed_path(&mut self, path: &Path, reason: &str) -> Result<SnapshotHash> {
@@ -223,8 +242,22 @@ impl SyncEngine {
             None => return self.full_sync(reason).await,
         };
 
-        let updated = self.remove_path_from_tree(&self.tree, &relative).await?;
-        self.publish_tree(reason, updated.unwrap_or_else(Tree::empty)).await
+        let update = self.index.remove_path(&relative)?;
+        self.publish_update(reason, update).await
+    }
+
+    async fn sync_moved_path(&mut self, from: &Path, to: &Path) -> Result<SnapshotHash> {
+        let from_relative = match self.relative_path(from) {
+            Some(relative) => relative,
+            None => return self.full_sync("local change").await,
+        };
+        let to_relative = match self.relative_path(to) {
+            Some(relative) => relative,
+            None => return self.full_sync("local change").await,
+        };
+
+        let update = self.index.move_path(&from_relative, &to_relative)?;
+        self.publish_update("local change", update).await
     }
 
     async fn save_state(&self) -> Result<()> {
@@ -295,141 +328,23 @@ impl SyncEngine {
         Ok(file)
     }
 
+    async fn build_index_from_disk(&self) -> Result<TreeIndex> {
+        let mut index = TreeIndex::empty();
+        let mut paths = Vec::new();
+        walk_files(&self.config.sync_root, &self.config.sync_root, &mut paths)?;
+
+        for path in paths {
+            let file = self.build_file_metadata(&path).await?;
+            let _ = index.upsert_file(&path, file)?;
+        }
+
+        Ok(index)
+    }
+
     fn relative_path(&self, path: &Path) -> Option<PathBuf> {
         path.strip_prefix(&self.config.sync_root)
             .ok()
             .map(Path::to_path_buf)
-    }
-
-    // TODO: simplify tree walk
-    async fn upsert_file_into_tree(&self, tree: &Tree, path: &Path, file: &File) -> Result<Tree> {
-        let components = Self::path_components(path)?;
-        if components.is_empty() {
-            return Ok(tree.clone());
-        }
-
-        let mut current = tree.clone();
-        let mut parents = Vec::new();
-        for name in &components[..components.len() - 1] {
-            let child = match current.entries.iter().find(|entry| entry.name == *name) {
-                Some(TreeEntry {
-                    kind: FileKind::Folder,
-                    hash: ObjectHash::Tree(hash),
-                    ..
-                }) => self.load_tree(*hash).await?,
-                Some(_) | None => Tree::empty(),
-            };
-            parents.push((current, name.clone()));
-            current = child;
-        }
-
-        let mut entries = current.entries.clone();
-        Self::set_tree_entry(
-            &mut entries,
-            TreeEntry {
-                name: components.last().cloned().unwrap(),
-                kind: FileKind::File,
-                hash: ObjectHash::File(file.hash),
-            },
-        );
-        current = Tree {
-            hash: [0; 32],
-            entries,
-        };
-        current.update_hash();
-
-        while let Some((parent, name)) = parents.pop() {
-            let mut entries = parent.entries.clone();
-            Self::set_tree_entry(
-                &mut entries,
-                TreeEntry {
-                    name,
-                    kind: FileKind::Folder,
-                    hash: ObjectHash::Tree(current.hash),
-                },
-            );
-            current = Tree {
-                hash: [0; 32],
-                entries,
-            };
-            current.update_hash();
-        }
-
-        Ok(current)
-    }
-
-    async fn remove_path_from_tree(&self, tree: &Tree, path: &Path) -> Result<Option<Tree>> {
-        let components = Self::path_components(path)?;
-        if components.is_empty() {
-            return Ok(Some(tree.clone()));
-        }
-
-        let mut current = tree.clone();
-        let mut parents = Vec::new();
-        for name in &components[..components.len() - 1] {
-            let Some(TreeEntry {
-                kind: FileKind::Folder,
-                hash: ObjectHash::Tree(hash),
-                ..
-            }) = current.entries.iter().find(|entry| entry.name == *name)
-            else {
-                return Ok(Some(tree.clone()));
-            };
-            let child = self.load_tree(*hash).await?;
-            parents.push((current, name.clone()));
-            current = child;
-        }
-
-        let leaf = components.last().cloned().unwrap();
-        let mut entries = current.entries.clone();
-        Self::remove_tree_entry(&mut entries, &leaf);
-        let mut current = if entries.is_empty() {
-            None
-        } else {
-            let mut tree = Tree {
-                hash: [0; 32],
-                entries,
-            };
-            tree.update_hash();
-            Some(tree)
-        };
-
-        while let Some((parent, name)) = parents.pop() {
-            let mut entries = parent.entries.clone();
-            Self::remove_tree_entry(&mut entries, &name);
-            if let Some(child) = current {
-                Self::set_tree_entry(
-                    &mut entries,
-                    TreeEntry {
-                        name,
-                        kind: FileKind::Folder,
-                        hash: ObjectHash::Tree(child.hash),
-                    },
-                );
-            }
-
-            current = if entries.is_empty() {
-                None
-            } else {
-                let mut tree = Tree {
-                    hash: [0; 32],
-                    entries,
-                };
-                tree.update_hash();
-                Some(tree)
-            };
-        }
-
-        Ok(current)
-    }
-
-    async fn load_tree(&self, hash: crate::core::TreeHash) -> Result<Tree> {
-        match self.obj_store.load_object(&ObjectId::Tree(hash)).await? {
-            Object::Tree(tree) => Ok(tree),
-            _ => Err(crate::services::SyncError::InvalidState(
-                "tree object lookup returned wrong type".into(),
-            )),
-        }
     }
 
     async fn load_snapshot(&self, hash: SnapshotHash) -> Result<Snapshot> {
@@ -526,34 +441,6 @@ impl SyncEngine {
         }
 
         Ok(files)
-    }
-
-    fn set_tree_entry(entries: &mut Vec<TreeEntry>, entry: TreeEntry) {
-        if let Some(index) = entries.iter().position(|existing| existing.name == entry.name) {
-            entries[index] = entry;
-        } else {
-            entries.push(entry);
-        }
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
-    }
-
-    fn remove_tree_entry(entries: &mut Vec<TreeEntry>, name: &str) {
-        if let Some(index) = entries.iter().position(|entry| entry.name == name) {
-            entries.remove(index);
-        }
-    }
-
-    fn path_components(path: &Path) -> Result<Vec<String>> {
-        path.components().map(Self::component_name).collect()
-    }
-
-    fn component_name(component: Component<'_>) -> Result<String> {
-        match component {
-            Component::Normal(name) => Ok(name.to_string_lossy().into_owned()),
-            _ => Err(crate::services::SyncError::InvalidState(
-                "tree update expected relative file paths".into(),
-            )),
-        }
     }
 
     fn log(&self, message: &str) {

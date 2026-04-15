@@ -57,6 +57,13 @@ pub struct ApplyJob {
     pub plan: ApplyPlan,
 }
 
+/// Result of building one local file version and staging any new blobs it references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileBuild {
+    file: File,
+    new_blobs: Vec<FullBlob>,
+}
+
 /// Runtime event delivered into the serialized sync engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
@@ -173,10 +180,6 @@ impl SyncEngine {
         let published_snapshot = self.state.published_snapshot;
         let snapshot = build_snapshot(&self.config.device_id, tree.hash, Some(&published_snapshot));
 
-        // Stage local blob bytes separately from object metadata.
-        self.log("staging local blobs");
-        self.stage_local_blobs().await?;
-
         // Persist the immutable objects locally before advertising the new snapshot.
         self.log("saving tree metadata to object db");
         for file in &update.files {
@@ -231,8 +234,8 @@ impl SyncEngine {
             return self.sync_removed_path(path, "local change").await;
         }
 
-        let file = self.build_file_metadata(&relative).await?;
-        let update = self.index.upsert_file(&relative, file)?;
+        let build = self.build_file(&relative).await?;
+        let update = self.index.upsert_file(&relative, build.file)?;
         self.publish_update("local change", update).await
     }
 
@@ -266,58 +269,36 @@ impl SyncEngine {
             .await
     }
 
-    // TODO: avoid!
-    async fn stage_local_blobs(&self) -> Result<()> {
-        let mut paths = Vec::new();
-        walk_files(&self.config.sync_root, &self.config.sync_root, &mut paths)?;
-
-        for path in paths {
-            let full_path = self.config.sync_root.join(&path);
-            let data = std::fs::read(&full_path)?;
-            let hash = hash_bytes(&data);
-            self.blob_store
-                .put_blob(&FullBlob {
-                    hash,
-                    size: data.len() as u64,
-                    data,
-                })
-                .await?;
-        }
-
-        Ok(())
-    }
-
     async fn build_change_diff(&self, base_snapshot: SnapshotHash) -> Result<TreeDiff> {
         let previous_files = self.load_snapshot_files(base_snapshot).await?;
-        let current_files = self.load_current_files().await?;
+        let current_files = self.load_index_files()?;
         Ok(crate::core::Tree::diff(&previous_files, &current_files))
     }
 
-    async fn load_current_files(&self) -> Result<BTreeMap<String, File>> {
-        let mut paths = Vec::new();
-        walk_files(&self.config.sync_root, &self.config.sync_root, &mut paths)?;
-
+    fn load_index_files(&self) -> Result<BTreeMap<String, File>> {
+        let update = self.index.materialize_all()?;
         let mut files = BTreeMap::new();
-        for path in paths {
-            let file = self.build_file_metadata(&path).await?;
+        for file in update.files {
             files.insert(file.path.clone(), file);
         }
-
         Ok(files)
     }
 
-    async fn build_file_metadata(&self, relative: &Path) -> Result<File> {
+    async fn build_file(&self, relative: &Path) -> Result<FileBuild> {
         let full_path = self.config.sync_root.join(relative);
         // TODO: Don't read whole file/blob.
         let data = std::fs::read(&full_path)?;
         let blob_hash = hash_bytes(&data);
-        self.blob_store
-            .put_blob(&FullBlob {
+        let mut new_blobs = Vec::new();
+        if !self.blob_store.has_blob(&blob_hash).await? {
+            let blob = FullBlob {
                 hash: blob_hash,
                 size: data.len() as u64,
                 data,
-            })
-            .await?;
+            };
+            self.blob_store.put_blob(&blob).await?;
+            new_blobs.push(blob);
+        }
 
         let mut file = File {
             path: relative.to_string_lossy().into_owned(),
@@ -325,7 +306,7 @@ impl SyncEngine {
             blobs: vec![blob_hash],
         };
         file.update_hash();
-        Ok(file)
+        Ok(FileBuild { file, new_blobs })
     }
 
     async fn build_index_from_disk(&self) -> Result<TreeIndex> {
@@ -334,8 +315,8 @@ impl SyncEngine {
         walk_files(&self.config.sync_root, &self.config.sync_root, &mut paths)?;
 
         for path in paths {
-            let file = self.build_file_metadata(&path).await?;
-            let _ = index.upsert_file(&path, file)?;
+            let build = self.build_file(&path).await?;
+            let _ = index.upsert_file(&path, build.file)?;
         }
 
         Ok(index)
@@ -552,6 +533,10 @@ mod tests {
             Self {
                 blobs: Mutex::new(BTreeMap::new()),
             }
+        }
+
+        fn len(&self) -> usize {
+            self.blobs.lock().unwrap().len()
         }
     }
 
@@ -858,6 +843,62 @@ mod tests {
         assert_eq!(tree_builder.calls(), 1);
         assert_ne!(after, before);
         assert!(engine.tree.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_updates_metadata_without_restaging_blob() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        let from_path = sync_root.join("docs/guide.md");
+        std::fs::write(&from_path, b"guide").unwrap();
+
+        let (config, file, docs_tree, root_tree) = sample_nested_config_and_tree(sync_root.clone());
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: [0; 32],
+            published_snapshot: [0; 32],
+            frontier: Frontier::default(),
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::File(file));
+        obj_store.insert(Object::Tree(docs_tree));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(root_tree.clone()));
+
+        let mut engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store.clone(),
+            coordinator,
+            tree_builder.clone(),
+        )
+        .await
+        .unwrap();
+
+        engine.start().await.unwrap();
+        assert_eq!(tree_builder.calls(), 1);
+        assert_eq!(blob_store.len(), 1);
+
+        let to_dir = sync_root.join("guides");
+        std::fs::create_dir_all(&to_dir).unwrap();
+        let to_path = to_dir.join("guide.md");
+        std::fs::rename(&from_path, &to_path).unwrap();
+
+        let before = engine.state.snapshot;
+        let after = engine
+            .handle_event(super::SyncEvent::Local(WatcherEvent::PathMoved {
+                from: from_path,
+                to: to_path,
+            }))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(tree_builder.calls(), 1);
+        assert_ne!(after, before);
+        assert_eq!(blob_store.len(), 1);
     }
 
     fn sample_config_and_tree(sync_root: PathBuf) -> (Config, File, Tree) {

@@ -4,7 +4,7 @@
 //! sync root and publish it to the coordinator. Runtime-driven local change handling can layer on
 //! top later without changing the core startup flow.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,8 +16,8 @@ use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
 use crate::local::util::{encode_hash, walk_files};
 use crate::services::{
-    ApplyPlan, BlobStore, Chunker, Coordinator, CoordinatorNotification, MetaStore, ObjStore,
-    Result, TreeBuilder, WatcherEvent,
+    ApplyOp, ApplyPlan, BlobStore, Chunker, Coordinator, CoordinatorNotification, MetaStore,
+    ObjStore, Result, TreeBuilder, WatcherEvent,
 };
 
 /// Serialized device-side sync state machine.
@@ -120,6 +120,15 @@ impl SyncEngine {
     /// Picks the next maximal remote frontier tip to reconcile toward.
     pub async fn next_remote_target(&self) -> Result<Option<(DeviceId, SnapshotHash)>> {
         Ok(self.candidate_remote_tips().await?.into_iter().next())
+    }
+
+    /// Builds a basic fast-forward apply plan for the next selected remote target.
+    pub async fn reconcile_next_remote_target(&self) -> Result<Option<ApplyPlan>> {
+        let Some((device_id, target)) = self.next_remote_target().await? else {
+            return Ok(None);
+        };
+
+        self.plan_remote_reconcile(&device_id, target).await
     }
 
     pub async fn open(
@@ -272,6 +281,14 @@ impl SyncEngine {
                     device_id,
                     encode_hash(&target)
                 ));
+                match self.plan_remote_reconcile(&device_id, target).await? {
+                    Some(plan) => self.log(&format!(
+                        "planned remote reconcile to {} with {} ops",
+                        encode_hash(&plan.target_snapshot),
+                        plan.ops.len()
+                    )),
+                    None => self.log("remote reconcile target is not directly applicable yet"),
+                }
             }
             None => self.log("no remote reconcile target after frontier update"),
         }
@@ -293,6 +310,39 @@ impl SyncEngine {
         ));
         self.log("remote reconcile/apply is not wired yet");
         Ok(())
+    }
+
+    /// Plans a fast-forward reconcile from the current local snapshot to a remote target.
+    async fn plan_remote_reconcile(
+        &self,
+        device_id: &DeviceId,
+        target: SnapshotHash,
+    ) -> Result<Option<ApplyPlan>> {
+        let snapshot = self.load_snapshot(target).await?;
+        let base = snapshot.parents.first().copied().unwrap_or([0; 32]);
+
+        if base != self.state.snapshot {
+            self.log(&format!(
+                "remote target {} from {} is not a fast-forward of local {}",
+                encode_hash(&target),
+                device_id,
+                encode_hash(&self.state.snapshot)
+            ));
+            return Ok(None);
+        }
+
+        let change_set = self
+            .coordinator
+            .fetch_change_set(&self.config.repo_id, &base, &target)
+            .await?;
+
+        if change_set.base != base || change_set.target != target {
+            return Err(crate::services::SyncError::InvalidState(
+                "coordinator returned mismatched change set".into(),
+            ));
+        }
+
+        Ok(Some(Self::build_apply_plan(target, &change_set.diff)))
     }
 
     async fn full_sync(&mut self, reason: &str) -> Result<SnapshotHash> {
@@ -485,6 +535,78 @@ impl SyncEngine {
             .map(Path::to_path_buf)
     }
 
+    /// Converts a tree diff into a simple apply plan.
+    fn build_apply_plan(target_snapshot: SnapshotHash, diff: &TreeDiff) -> ApplyPlan {
+        let mut removes = Vec::new();
+        let mut directories = BTreeSet::new();
+        let mut writes = Vec::new();
+
+        Self::collect_apply_ops(
+            PathBuf::new(),
+            diff,
+            &mut removes,
+            &mut directories,
+            &mut writes,
+        );
+
+        removes.sort_by(|left, right| {
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut ops = Vec::new();
+        for path in removes {
+            ops.push(ApplyOp::RemovePath { path });
+        }
+        for path in directories {
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            ops.push(ApplyOp::CreateDir { path });
+        }
+        writes.sort_by(|left, right| left.0.cmp(&right.0));
+        for (path, file) in writes {
+            ops.push(ApplyOp::WriteFile { path, file });
+        }
+
+        ApplyPlan {
+            target_snapshot,
+            ops,
+        }
+    }
+
+    fn collect_apply_ops(
+        prefix: PathBuf,
+        diff: &TreeDiff,
+        removes: &mut Vec<PathBuf>,
+        directories: &mut BTreeSet<PathBuf>,
+        writes: &mut Vec<(PathBuf, File)>,
+    ) {
+        for (name, change) in &diff.entries {
+            let path = prefix.join(name);
+            match change {
+                crate::core::TreeChange::Delete => removes.push(path),
+                crate::core::TreeChange::Tree(child) => {
+                    Self::collect_apply_ops(path, child, removes, directories, writes);
+                }
+                crate::core::TreeChange::File(file) => {
+                    let mut parent = path.parent();
+                    while let Some(dir) = parent {
+                        if dir.as_os_str().is_empty() {
+                            break;
+                        }
+                        directories.insert(dir.to_path_buf());
+                        parent = dir.parent();
+                    }
+                    writes.push((path, file.clone()));
+                }
+            }
+        }
+    }
+
     async fn load_snapshot(&self, hash: SnapshotHash) -> Result<Snapshot> {
         match Self::load_saved_snapshot(&*self.obj_store, hash).await {
             Ok(snapshot) => Ok(snapshot),
@@ -644,13 +766,13 @@ mod tests {
     use crate::core::{
         ChangeSet, Config, DeviceCredentials, DeviceState, File, FileKind, Frontier, FullBlob,
         Object, ObjectHash, ObjectId, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
-        TreeEntry,
+        TreeChange, TreeDiff, TreeEntry,
     };
     use crate::local::util::hash_bytes;
     use crate::local::{LocalChunker, build_snapshot};
     use crate::services::{
-        BlobStore, Coordinator, CoordinatorNotification, CoordinatorNotificationStream, MetaStore,
-        ObjStore, Result, SyncError, TreeBuilder, WatcherEvent,
+        ApplyOp, BlobStore, Coordinator, CoordinatorNotification, CoordinatorNotificationStream,
+        MetaStore, ObjStore, Result, SyncError, TreeBuilder, WatcherEvent,
     };
 
     struct MemoryMetaStore {
@@ -1343,6 +1465,129 @@ mod tests {
             engine.next_remote_target().await.unwrap(),
             Some(("peer-b".into(), tip_snapshot.hash))
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_next_remote_target_builds_fast_forward_plan() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let base_snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
+        let target_snapshot =
+            build_snapshot(&"peer-1".to_string(), [3; 32], Some(&base_snapshot.hash));
+        let mut diff = TreeDiff {
+            entries: BTreeMap::new(),
+        };
+        let docs_file = File {
+            path: "docs/readme.txt".into(),
+            hash: [8; 32],
+            blobs: vec![[9; 32]],
+        };
+        diff.insert_path(Path::new("stale.txt"), TreeChange::Delete);
+        diff.insert_path(
+            Path::new("docs/readme.txt"),
+            TreeChange::File(docs_file.clone()),
+        );
+
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: base_snapshot.hash,
+            published_snapshot: base_snapshot.hash,
+            frontier: Frontier {
+                device_snapshots: BTreeMap::from([("peer-1".into(), target_snapshot.hash)]),
+            },
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::Tree(tree.clone()));
+        obj_store.insert(Object::Snapshot(base_snapshot.clone()));
+        obj_store.insert(Object::Snapshot(target_snapshot.clone()));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        coordinator.insert_change_set(ChangeSet {
+            base: base_snapshot.hash,
+            target: target_snapshot.hash,
+            diff,
+        });
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            coordinator,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        let plan = engine
+            .reconcile_next_remote_target()
+            .await
+            .unwrap()
+            .expect("expected fast-forward plan");
+
+        assert_eq!(plan.target_snapshot, target_snapshot.hash);
+        assert_eq!(
+            plan.ops,
+            vec![
+                ApplyOp::RemovePath {
+                    path: PathBuf::from("stale.txt"),
+                },
+                ApplyOp::CreateDir {
+                    path: PathBuf::from("docs"),
+                },
+                ApplyOp::WriteFile {
+                    path: PathBuf::from("docs/readme.txt"),
+                    file: docs_file,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_next_remote_target_skips_non_fast_forward_tip() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let local_snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
+        let remote_base = build_snapshot(&"peer-1".to_string(), [4; 32], Some(&[0; 32]));
+        let remote_tip = build_snapshot(&"peer-1".to_string(), [5; 32], Some(&remote_base.hash));
+
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: local_snapshot.hash,
+            published_snapshot: local_snapshot.hash,
+            frontier: Frontier {
+                device_snapshots: BTreeMap::from([("peer-1".into(), remote_tip.hash)]),
+            },
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::Tree(tree.clone()));
+        obj_store.insert(Object::Snapshot(local_snapshot));
+        obj_store.insert(Object::Snapshot(remote_tip));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            coordinator,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(engine.reconcile_next_remote_target().await.unwrap(), None);
     }
 
     #[tokio::test]

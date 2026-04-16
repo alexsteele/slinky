@@ -73,10 +73,7 @@ pub enum SyncEvent {
 
 impl SyncEngine {
     /// Returns the known remote tips that differ from the current local snapshot.
-    ///
-    /// This is a simple frontier view for now. Later we should prune any tip that is known to be
-    /// behind another tip in the snapshot graph.
-    pub fn candidate_remote_tips(&self) -> Vec<(DeviceId, SnapshotHash)> {
+    fn candidate_remote_tip_set(&self) -> Vec<(DeviceId, SnapshotHash)> {
         let mut tips = Vec::new();
         for (device_id, snapshot) in &self.state.frontier.device_snapshots {
             if device_id == &self.config.device_id {
@@ -91,11 +88,35 @@ impl SyncEngine {
         tips
     }
 
-    /// Picks the next remote frontier tip to reconcile toward.
-    ///
-    /// The current choice is deterministic but not ancestry-aware. It is only a scheduler stub.
-    pub fn next_remote_target(&self) -> Option<(DeviceId, SnapshotHash)> {
-        self.candidate_remote_tips().into_iter().next()
+    /// Returns the maximal remote frontier tips after pruning tips that are behind others.
+    pub async fn candidate_remote_tips(&self) -> Result<Vec<(DeviceId, SnapshotHash)>> {
+        let tips = self.candidate_remote_tip_set();
+        let mut maximal = Vec::new();
+
+        for (device_id, snapshot) in &tips {
+            let mut dominated = false;
+            for (_, other_snapshot) in &tips {
+                if snapshot == other_snapshot {
+                    continue;
+                }
+                if self.is_snapshot_ancestor(*snapshot, *other_snapshot).await? {
+                    dominated = true;
+                    break;
+                }
+            }
+
+            if !dominated {
+                maximal.push((device_id.clone(), *snapshot));
+            }
+        }
+
+        maximal.sort();
+        Ok(maximal)
+    }
+
+    /// Picks the next maximal remote frontier tip to reconcile toward.
+    pub async fn next_remote_target(&self) -> Result<Option<(DeviceId, SnapshotHash)>> {
+        Ok(self.candidate_remote_tips().await?.into_iter().next())
     }
 
     pub async fn open(
@@ -450,7 +471,50 @@ impl SyncEngine {
     }
 
     async fn load_snapshot(&self, hash: SnapshotHash) -> Result<Snapshot> {
-        Self::load_saved_snapshot(&*self.obj_store, hash).await
+        match Self::load_saved_snapshot(&*self.obj_store, hash).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(crate::services::SyncError::NotFound) => {
+                let snapshot = self
+                    .coordinator
+                    .fetch_snapshot(&self.config.repo_id, &hash)
+                    .await?;
+                self.obj_store
+                    .save_object(&Object::Snapshot(snapshot.clone()))
+                    .await?;
+                Ok(snapshot)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn is_snapshot_ancestor(
+        &self,
+        ancestor: SnapshotHash,
+        descendant: SnapshotHash,
+    ) -> Result<bool> {
+        if ancestor == descendant {
+            return Ok(false);
+        }
+
+        let mut pending = vec![descendant];
+        let mut seen = std::collections::BTreeSet::new();
+
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let snapshot = self.load_snapshot(current).await?;
+            for parent in snapshot.parents {
+                if parent == ancestor {
+                    return Ok(true);
+                }
+                if parent != [0; 32] {
+                    pending.push(parent);
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     async fn load_saved_snapshot(obj_store: &dyn ObjStore, hash: SnapshotHash) -> Result<Snapshot> {
@@ -1340,7 +1404,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(engine.candidate_remote_tips(), vec![("peer-b".into(), [9; 32])]);
+        assert_eq!(
+            engine.candidate_remote_tips().await.unwrap(),
+            vec![("peer-b".into(), [9; 32])]
+        );
     }
 
     #[tokio::test]
@@ -1350,17 +1417,21 @@ mod tests {
         std::fs::create_dir_all(&sync_root).unwrap();
 
         let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let snapshot_a = build_snapshot(&"peer-a".to_string(), [2; 32], Some(&[0; 32]));
+        let snapshot_b = build_snapshot(&"peer-b".to_string(), [3; 32], Some(&[0; 32]));
         let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
             snapshot: [0; 32],
             published_snapshot: [0; 32],
             frontier: Frontier {
                 device_snapshots: BTreeMap::from([
-                    ("peer-b".into(), [3; 32]),
-                    ("peer-a".into(), [2; 32]),
+                    ("peer-b".into(), snapshot_b.hash),
+                    ("peer-a".into(), snapshot_a.hash),
                 ]),
             },
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::Snapshot(snapshot_a.clone()));
+        obj_store.insert(Object::Snapshot(snapshot_b.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
@@ -1378,7 +1449,57 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(engine.next_remote_target(), Some(("peer-a".into(), [2; 32])));
+        assert_eq!(
+            engine.next_remote_target().await.unwrap(),
+            Some(("peer-a".into(), snapshot_a.hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_remote_tips_prunes_ancestor_tips() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, file, tree) = sample_config_and_tree(sync_root.clone());
+        let base_snapshot = build_snapshot(&"peer-base".to_string(), [2; 32], Some(&[0; 32]));
+        let tip_snapshot = build_snapshot(&"peer-tip".to_string(), [3; 32], Some(&base_snapshot.hash));
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: [0; 32],
+            published_snapshot: [0; 32],
+            frontier: Frontier {
+                device_snapshots: BTreeMap::from([
+                    ("peer-a".into(), base_snapshot.hash),
+                    ("peer-b".into(), tip_snapshot.hash),
+                ]),
+            },
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::File(file));
+        obj_store.insert(Object::Tree(tree));
+        obj_store.insert(Object::Snapshot(base_snapshot.clone()));
+        obj_store.insert(Object::Snapshot(tip_snapshot.clone()));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree: Tree::empty() });
+        let chunker = LocalChunker::open();
+
+        let engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            coordinator,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            engine.candidate_remote_tips().await.unwrap(),
+            vec![("peer-b".into(), tip_snapshot.hash)]
+        );
     }
 
     fn sample_config_and_tree(sync_root: PathBuf) -> (Config, File, Tree) {

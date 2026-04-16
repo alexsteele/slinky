@@ -102,6 +102,7 @@ impl Device {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::tempdir;
@@ -196,13 +197,14 @@ mod tests {
             .unwrap();
 
         std::fs::write(sync_root.join("hello.txt"), b"hello updated").unwrap();
-        sleep(Duration::from_secs(1)).await;
+        let updated_snapshot =
+            wait_for_snapshot_change(&device, meta_store.clone(), initial_state.snapshot).await;
 
         device.stop().await.unwrap();
         device.join().await.unwrap();
 
         let engine = device.service.engine.as_ref().unwrap();
-        assert_ne!(engine.state.snapshot, initial_state.snapshot);
+        assert_eq!(engine.state.snapshot, updated_snapshot);
         assert!(engine
             .tree
             .entries
@@ -241,13 +243,14 @@ mod tests {
             .unwrap();
 
         std::fs::remove_dir_all(sync_root.join("docs")).unwrap();
-        sleep(Duration::from_secs(1)).await;
+        let updated_snapshot =
+            wait_for_snapshot_change(&device, meta_store.clone(), initial_state.snapshot).await;
 
         device.stop().await.unwrap();
         device.join().await.unwrap();
 
         let engine = device.service.engine.as_ref().unwrap();
-        assert_ne!(engine.state.snapshot, initial_state.snapshot);
+        assert_eq!(engine.state.snapshot, updated_snapshot);
         assert!(engine.tree.entries.is_empty());
     }
 
@@ -285,13 +288,14 @@ mod tests {
         std::fs::create_dir_all(sync_root.join("guides")).unwrap();
         let to_path = sync_root.join("guides/guide.md");
         std::fs::rename(&from_path, &to_path).unwrap();
-        sleep(Duration::from_secs(1)).await;
+        let updated_snapshot =
+            wait_for_snapshot_change(&device, meta_store.clone(), initial_state.snapshot).await;
 
         device.stop().await.unwrap();
         device.join().await.unwrap();
 
         let engine = device.service.engine.as_ref().unwrap();
-        assert_ne!(engine.state.snapshot, initial_state.snapshot);
+        assert_eq!(engine.state.snapshot, updated_snapshot);
         assert!(engine
             .tree
             .entries
@@ -302,5 +306,25 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.name == "docs"));
+    }
+
+    async fn wait_for_snapshot_change(
+        device: &Device,
+        meta_store: Arc<dyn crate::services::MetaStore>,
+        previous: [u8; 32],
+    ) -> [u8; 32] {
+        for _ in 0..20 {
+            let snapshot = meta_store
+                .load_state(&device.config.repo_id, &device.config.device_id)
+                .await
+                .unwrap()
+                .snapshot;
+            if snapshot != previous {
+                return snapshot;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+
+        panic!("timed out waiting for snapshot change");
     }
 }

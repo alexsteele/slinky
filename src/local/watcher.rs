@@ -19,11 +19,14 @@ impl Watcher for FsWatcher {
         mut shutdown: oneshot::Receiver<()>,
     ) -> Result<()> {
         let root = std::fs::canonicalize(root)?;
+        eprintln!("[watcher] watching {}", root.display());
         let tx = tx.clone();
         let mut watcher: RecommendedWatcher = recommended_watcher(
             move |result: notify::Result<notify::Event>| match result {
                 Ok(event) => {
+                    eprintln!("[watcher] notify event: {:?}", event);
                     for message in map_notify_event(event) {
+                        eprintln!("[watcher] mapped event: {:?}", message);
                         let _ = tx.blocking_send(message);
                     }
                 }
@@ -38,9 +41,11 @@ impl Watcher for FsWatcher {
         watcher
             .watch(&root, RecursiveMode::Recursive)
             .map_err(|err| SyncError::InvalidState(err.to_string()))?;
+        eprintln!("[watcher] ready");
         let _ = ready.send(());
 
         let _ = (&mut shutdown).await;
+        eprintln!("[watcher] stopped");
         Ok(())
     }
 }

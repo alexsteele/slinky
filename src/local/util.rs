@@ -5,11 +5,18 @@ use sha2::{Digest, Sha256};
 use crate::core::{BlobHash, Config};
 use crate::services::{Result, SyncError};
 
+/// Returns the root directory for local repo state.
 pub fn device_root(config: &Config) -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| SyncError::InvalidState("HOME is not set".into()))?;
-    Ok(home.join(".slinky").join(&config.repo_id))
+    let key_dir = config
+        .credentials
+        .private_key_path
+        .parent()
+        .ok_or_else(|| SyncError::InvalidState("device key path has no parent".into()))?;
+    let root = match key_dir.file_name().and_then(|name| name.to_str()) {
+        Some("keys") => key_dir.parent().unwrap_or(key_dir),
+        _ => key_dir,
+    };
+    Ok(root.join("repos").join(&config.repo_id))
 }
 
 pub fn walk_files(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -63,5 +70,49 @@ fn decode_hex(byte: u8) -> Result<u8> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(SyncError::InvalidState("invalid hex digit".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::device_root;
+    use crate::core::{Config, DeviceCredentials};
+
+    #[test]
+    fn device_root_uses_parent_of_keys_directory() {
+        let config = Config {
+            sync_root: PathBuf::from("/tmp/sync"),
+            repo_id: "repo-1".into(),
+            device_id: "device-1".into(),
+            credentials: DeviceCredentials {
+                public_key: "pub".into(),
+                private_key_path: PathBuf::from("/tmp/node/keys/device.key"),
+            },
+        };
+
+        assert_eq!(
+            device_root(&config).unwrap(),
+            PathBuf::from("/tmp/node/repos/repo-1"),
+        );
+    }
+
+    #[test]
+    fn device_root_uses_key_directory_when_no_keys_folder_exists() {
+        let config = Config {
+            sync_root: PathBuf::from("/tmp/sync"),
+            repo_id: "repo-1".into(),
+            device_id: "device-1".into(),
+            credentials: DeviceCredentials {
+                public_key: "pub".into(),
+                private_key_path: PathBuf::from("/tmp/node/device.key"),
+            },
+        };
+
+        assert_eq!(
+            device_root(&config).unwrap(),
+            PathBuf::from("/tmp/node/repos/repo-1"),
+        );
     }
 }

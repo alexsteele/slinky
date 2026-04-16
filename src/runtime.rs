@@ -49,6 +49,7 @@ impl SyncService {
             .engine
             .take()
             .ok_or_else(|| SyncError::InvalidState("sync engine is not available".into()))?;
+        eprintln!("[service] starting engine");
         engine.start().await?;
 
         let (event_tx, mut event_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
@@ -61,6 +62,7 @@ impl SyncService {
         self.watcher_shutdown_tx = Some(watcher_shutdown_tx);
 
         self.watcher_task = Some(tokio::spawn(async move {
+            eprintln!("[service] starting watcher task");
             watcher
                 .start(&sync_root, event_tx, watcher_ready_tx, watcher_shutdown_rx)
                 .await
@@ -69,11 +71,16 @@ impl SyncService {
         self.engine_task = Some(tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = &mut shutdown_rx => break,
+                    _ = &mut shutdown_rx => {
+                        eprintln!("[service] engine task shutting down");
+                        break
+                    },
                     event = event_rx.recv() => {
                         let Some(event) = event else {
+                            eprintln!("[service] event channel closed");
                             break;
                         };
+                        eprintln!("[service] forwarding local event: {:?}", event);
                         engine.handle_event(SyncEvent::Local(event)).await?;
                     }
                 }
@@ -85,11 +92,13 @@ impl SyncService {
             .await
             .map_err(|_| SyncError::InvalidState("watcher failed to report readiness".into()))?;
 
+        eprintln!("[service] watcher ready");
         self.started = true;
         Ok(())
     }
 
     pub async fn stop(&mut self) -> Result<()> {
+        eprintln!("[service] stopping");
         self.started = false;
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());

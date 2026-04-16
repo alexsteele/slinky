@@ -6,7 +6,7 @@ use slinky::cli::{Cli, Command, CoordinatorCommand};
 use slinky::core::{Config, DeviceCredentials};
 use slinky::device::Device;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
 

@@ -121,6 +121,20 @@ Totally self hosted. Easy setup. No third party managed service.
 - Garbage collection should start from retained snapshots and delete only unreachable objects.
 - MVP should keep retention conservative.
 
+## Frontiers
+
+- A frontier tracks the latest known tip snapshot for each device.
+- Devices use frontiers to understand which remote tips are furthest ahead.
+- Sync should target frontier tips, not "a peer". Peers are only announcement sources.
+- A tip that is an ancestor of another known tip is not interesting to sync toward.
+- Over time, devices should reduce the known tips to the maximal frontier set.
+- To sync, devices gather the known remote tips and drop any tip already incorporated locally.
+- Devices then drop any tip that is behind another known tip.
+- If one maximal remote tip remains, devices reconcile toward that snapshot.
+- If several maximal remote tips remain, devices treat them as concurrent heads and merge later.
+- If one frontier tip remains, devices can reconcile toward it directly.
+- If several unrelated frontier tips remain, devices have concurrent heads to merge later.
+
 ## Conflict Resolution
 
 - Conflict resolution stays file-level in MVP even though storage is chunk-based.

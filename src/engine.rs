@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::{
-    BlobHash, ChangeSet, Config, DeviceState, File, Object, ObjectId, Snapshot,
+    BlobHash, ChangeSet, Config, DeviceId, DeviceState, File, Object, ObjectId, Snapshot,
     SnapshotAnnouncement, SnapshotHash, Tree, TreeDiff,
 };
 use crate::index::{TreeIndex, TreeUpdate};
@@ -72,6 +72,32 @@ pub enum SyncEvent {
 }
 
 impl SyncEngine {
+    /// Returns the known remote tips that differ from the current local snapshot.
+    ///
+    /// This is a simple frontier view for now. Later we should prune any tip that is known to be
+    /// behind another tip in the snapshot graph.
+    pub fn candidate_remote_tips(&self) -> Vec<(DeviceId, SnapshotHash)> {
+        let mut tips = Vec::new();
+        for (device_id, snapshot) in &self.state.frontier.device_snapshots {
+            if device_id == &self.config.device_id {
+                continue;
+            }
+            if *snapshot == [0; 32] || *snapshot == self.state.snapshot {
+                continue;
+            }
+            tips.push((device_id.clone(), *snapshot));
+        }
+        tips.sort();
+        tips
+    }
+
+    /// Picks the next remote frontier tip to reconcile toward.
+    ///
+    /// The current choice is deterministic but not ancestry-aware. It is only a scheduler stub.
+    pub fn next_remote_target(&self) -> Option<(DeviceId, SnapshotHash)> {
+        self.candidate_remote_tips().into_iter().next()
+    }
+
     pub async fn open(
         config: Config,
         meta_store: Arc<dyn MetaStore>,
@@ -1271,6 +1297,88 @@ mod tests {
         );
         assert_eq!(engine.state.snapshot, local_snapshot.hash);
         assert_eq!(engine.state.published_snapshot, local_snapshot.hash);
+    }
+
+    #[tokio::test]
+    async fn candidate_remote_tips_filters_self_and_current_snapshot() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, file, tree) = sample_config_and_tree(sync_root.clone());
+        let local_snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: local_snapshot.hash,
+            published_snapshot: local_snapshot.hash,
+            frontier: Frontier {
+                device_snapshots: BTreeMap::from([
+                    (config.device_id.clone(), local_snapshot.hash),
+                    ("peer-a".into(), local_snapshot.hash),
+                    ("peer-b".into(), [9; 32]),
+                    ("peer-c".into(), [0; 32]),
+                ]),
+            },
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::File(file));
+        obj_store.insert(Object::Tree(tree.clone()));
+        obj_store.insert(Object::Snapshot(local_snapshot.clone()));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            coordinator,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(engine.candidate_remote_tips(), vec![("peer-b".into(), [9; 32])]);
+    }
+
+    #[tokio::test]
+    async fn next_remote_target_is_deterministic() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: [0; 32],
+            published_snapshot: [0; 32],
+            frontier: Frontier {
+                device_snapshots: BTreeMap::from([
+                    ("peer-b".into(), [3; 32]),
+                    ("peer-a".into(), [2; 32]),
+                ]),
+            },
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            coordinator,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(engine.next_remote_target(), Some(("peer-a".into(), [2; 32])));
     }
 
     fn sample_config_and_tree(sync_root: PathBuf) -> (Config, File, Tree) {

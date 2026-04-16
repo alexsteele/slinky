@@ -200,18 +200,36 @@ impl SyncEngine {
             .coordinator
             .fetch_change_set(&self.config.repo_id, &base, &snapshot.hash)
             .await?;
+        self.obj_store
+            .save_object(&Object::Snapshot(snapshot.clone()))
+            .await?;
 
         self.log(&format!(
             "fetched remote snapshot {} with base {}",
             encode_hash(&snapshot.hash),
             encode_hash(&change_set.base)
         ));
-        self.log("remote reconcile/apply is not wired yet");
-
         self.state
             .frontier
             .device_snapshots
-            .insert(announcement.device, snapshot.hash);
+            .insert(announcement.device.clone(), snapshot.hash);
+
+        if snapshot.hash == self.state.snapshot {
+            self.log("remote snapshot already matches local snapshot");
+            return Ok(());
+        }
+
+        if snapshot.hash == self.state.published_snapshot {
+            self.log("remote snapshot already matches published snapshot");
+            return Ok(());
+        }
+
+        self.log(&format!(
+            "remote snapshot {} from {} is pending reconcile",
+            encode_hash(&snapshot.hash),
+            announcement.device
+        ));
+        self.log("remote reconcile/apply is not wired yet");
         Ok(())
     }
 
@@ -1127,6 +1145,14 @@ mod tests {
             engine.state.frontier.device_snapshots.get("peer-1"),
             Some(&remote_snapshot.hash)
         );
+        assert!(matches!(
+            engine
+                .obj_store
+                .load_object(&ObjectId::Snapshot(remote_snapshot.hash))
+                .await
+                .unwrap(),
+            Object::Snapshot(_)
+        ));
     }
 
     #[tokio::test]
@@ -1174,6 +1200,77 @@ mod tests {
             .unwrap();
 
         assert!(engine.state.frontier.device_snapshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_notification_recognizes_current_snapshot() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+        std::fs::write(sync_root.join("hello.txt"), b"hello").unwrap();
+
+        let (config, file, tree) = sample_config_and_tree(sync_root.clone());
+        let local_snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: local_snapshot.hash,
+            published_snapshot: local_snapshot.hash,
+            frontier: Frontier::default(),
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::File(file));
+        obj_store.insert(Object::Tree(tree.clone()));
+        obj_store.insert(Object::Snapshot(local_snapshot.clone()));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let mut engine = SyncEngine::open(
+            config.clone(),
+            meta_store,
+            obj_store,
+            blob_store,
+            coordinator.clone(),
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        let remote_snapshot = Snapshot {
+            hash: local_snapshot.hash,
+            parents: local_snapshot.parents.clone(),
+            tree_hash: local_snapshot.tree_hash,
+            origin: "peer-1".into(),
+            timestamp: local_snapshot.timestamp,
+        };
+        let remote_change_set = ChangeSet {
+            base: local_snapshot.parents.first().copied().unwrap_or([0; 32]),
+            target: remote_snapshot.hash,
+            diff: crate::core::TreeDiff {
+                entries: BTreeMap::new(),
+            },
+        };
+        coordinator.insert_snapshot(remote_snapshot.clone());
+        coordinator.insert_change_set(remote_change_set);
+
+        engine
+            .handle_event(super::SyncEvent::Remote(
+                CoordinatorNotification::Snapshot(SnapshotAnnouncement {
+                    repo_id: config.repo_id.clone(),
+                    snapshot: remote_snapshot.hash,
+                    device: "peer-1".into(),
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine.state.frontier.device_snapshots.get("peer-1"),
+            Some(&remote_snapshot.hash)
+        );
+        assert_eq!(engine.state.snapshot, local_snapshot.hash);
+        assert_eq!(engine.state.published_snapshot, local_snapshot.hash);
     }
 
     fn sample_config_and_tree(sync_root: PathBuf) -> (Config, File, Tree) {

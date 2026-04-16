@@ -158,6 +158,53 @@ impl TreeIndex {
         self.build_update(changed_trees, changed_files, deleted_paths)
     }
 
+    /// Ensure a directory exists at a relative path.
+    pub fn ensure_directory(&mut self, path: &Path) -> Result<TreeUpdate> {
+        let components = path_components(path)?;
+        if components.is_empty() {
+            return self.build_update(BTreeSet::new(), BTreeSet::new(), Vec::new());
+        }
+
+        let mut current = self.root;
+        let mut created = false;
+
+        for name in components {
+            if let Some(child) = self.child(current, &name)? {
+                let child_node = self.node(child)?;
+                match child_node.kind {
+                    NodeKind::Tree { .. } => {
+                        current = child;
+                        continue;
+                    }
+                    NodeKind::File { .. } => {
+                        return Err(SyncError::InvalidState(
+                            "tree index expected a directory path".into(),
+                        ));
+                    }
+                }
+            }
+
+            let child_id = self.alloc_node(Node {
+                parent: Some(current),
+                name: name.clone(),
+                kind: NodeKind::Tree {
+                    hash: TreeHash::default(),
+                    children: BTreeMap::new(),
+                },
+            });
+            self.insert_child(current, name, child_id)?;
+            current = child_id;
+            created = true;
+        }
+
+        if !created {
+            return self.build_update(BTreeSet::new(), BTreeSet::new(), Vec::new());
+        }
+
+        let changed_trees = self.rehash_ancestors(current)?;
+        self.build_update(changed_trees, BTreeSet::new(), Vec::new())
+    }
+
     /// Remove a file or subtree at a relative path.
     pub fn remove_path(&mut self, path: &Path) -> Result<TreeUpdate> {
         let components = path_components(path)?;
@@ -678,6 +725,33 @@ mod tests {
         assert_eq!(update.deleted_paths, Vec::<String>::new());
         assert_eq!(update.root, materialized_root(&index));
         assert_eq!(update.trees.len(), 2);
+    }
+
+    #[test]
+    fn ensure_directory_creates_missing_parents_and_updates_root() {
+        let mut index = TreeIndex::empty();
+
+        let update = index.ensure_directory(Path::new("docs/guides")).unwrap();
+
+        assert!(index.resolve_path(Path::new("docs")).unwrap().is_some());
+        assert!(index.resolve_path(Path::new("docs/guides")).unwrap().is_some());
+        assert_eq!(update.files, Vec::<File>::new());
+        assert_eq!(update.deleted_paths, Vec::<String>::new());
+        assert_eq!(update.root, materialized_root(&index));
+        assert_eq!(update.trees.len(), 3);
+    }
+
+    #[test]
+    fn ensure_directory_is_noop_for_existing_directory() {
+        let mut index = TreeIndex::empty();
+        index.ensure_directory(Path::new("docs")).unwrap();
+
+        let update = index.ensure_directory(Path::new("docs")).unwrap();
+
+        assert_eq!(update.files, Vec::<File>::new());
+        assert_eq!(update.trees, Vec::<Tree>::new());
+        assert_eq!(update.deleted_paths, Vec::<String>::new());
+        assert_eq!(update.root, materialized_root(&index));
     }
 
     #[test]

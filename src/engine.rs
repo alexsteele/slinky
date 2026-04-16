@@ -124,7 +124,7 @@ impl SyncEngine {
             }
             SyncEvent::Local(WatcherEvent::DirectoryCreated(path)) => {
                 self.log(&format!("local directory created: {}", path.display()));
-                Ok(Some(self.full_sync("local directory create").await?))
+                self.sync_created_directory(&path).await.map(Some)
             }
             SyncEvent::Local(WatcherEvent::DirectoryDeleted(path)) => {
                 self.log(&format!("local directory deleted: {}", path.display()));
@@ -239,6 +239,19 @@ impl SyncEngine {
         let build = self.build_file(&relative).await?;
         let update = self.index.upsert_file(&relative, build.file)?;
         self.publish_update("local change", update).await
+    }
+
+    async fn sync_created_directory(&mut self, path: &Path) -> Result<SnapshotHash> {
+        let relative = match self.relative_path(path) {
+            Some(relative) => relative,
+            None => return self.full_sync("local directory create").await,
+        };
+
+        let update = match self.index.ensure_directory(&relative) {
+            Ok(update) => update,
+            Err(_) => return self.full_sync("local directory create").await,
+        };
+        self.publish_update("local directory create", update).await
     }
 
     async fn sync_removed_path(&mut self, path: &Path, reason: &str) -> Result<SnapshotHash> {

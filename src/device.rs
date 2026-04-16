@@ -4,8 +4,7 @@ use crate::core::Config;
 use crate::engine::SyncEngine;
 use crate::local::{
     FsWatcher, LocalBlobStore, LocalChunker, LocalMetaStore, LocalObjStore, LocalTreeBuilder,
-    NoopCoordinator,
-    load_config,
+    NoopCoordinator, load_config,
 };
 use crate::runtime::SyncService;
 use crate::services::{
@@ -106,11 +105,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::tempdir;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     use super::Device;
     use crate::core::{Config, DeviceCredentials, FileKind, Object, ObjectId};
-    use crate::local::{LocalMetaStore};
+    use crate::local::LocalMetaStore;
     use crate::local::util::{device_root, encode_hash, hash_bytes};
 
     #[tokio::test]
@@ -205,11 +204,13 @@ mod tests {
 
         let engine = device.service.engine.as_ref().unwrap();
         assert_eq!(engine.state.snapshot, updated_snapshot);
-        assert!(engine
-            .tree
-            .entries
-            .iter()
-            .any(|entry| entry.name == "hello.txt" && entry.kind == FileKind::File));
+        assert!(
+            engine
+                .tree
+                .entries
+                .iter()
+                .any(|entry| entry.name == "hello.txt" && entry.kind == FileKind::File)
+        );
     }
 
     #[tokio::test]
@@ -293,16 +294,20 @@ mod tests {
 
         let engine = device.service.engine.as_ref().unwrap();
         assert_eq!(engine.state.snapshot, updated_snapshot);
-        assert!(engine
-            .index
-            .resolve_path(std::path::Path::new("docs/guide.md"))
-            .unwrap()
-            .is_none());
-        assert!(engine
-            .index
-            .resolve_path(std::path::Path::new("docs"))
-            .unwrap()
-            .is_none());
+        assert!(
+            engine
+                .index
+                .resolve_path(std::path::Path::new("docs/guide.md"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .index
+                .resolve_path(std::path::Path::new("docs"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -343,16 +348,20 @@ mod tests {
 
         let engine = device.service.engine.as_ref().unwrap();
         assert_eq!(engine.state.snapshot, initial_state.snapshot);
-        assert!(engine
-            .index
-            .resolve_path(std::path::Path::new("docs"))
-            .unwrap()
-            .is_none());
-        assert!(engine
-            .tree
-            .entries
-            .iter()
-            .any(|entry| entry.name == "hello.txt" && entry.kind == FileKind::File));
+        assert!(
+            engine
+                .index
+                .resolve_path(std::path::Path::new("docs"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .tree
+                .entries
+                .iter()
+                .any(|entry| entry.name == "hello.txt" && entry.kind == FileKind::File)
+        );
     }
 
     #[tokio::test]
@@ -397,16 +406,14 @@ mod tests {
 
         let engine = device.service.engine.as_ref().unwrap();
         assert_eq!(engine.state.snapshot, updated_snapshot);
-        assert!(engine
-            .tree
-            .entries
-            .iter()
-            .any(|entry| entry.name == "guides" && entry.kind == FileKind::Folder));
-        assert!(!engine
-            .tree
-            .entries
-            .iter()
-            .any(|entry| entry.name == "docs"));
+        assert!(
+            engine
+                .tree
+                .entries
+                .iter()
+                .any(|entry| entry.name == "guides" && entry.kind == FileKind::Folder)
+        );
+        assert!(!engine.tree.entries.iter().any(|entry| entry.name == "docs"));
     }
 
     #[tokio::test]

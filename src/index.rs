@@ -218,9 +218,9 @@ impl TreeIndex {
         }
 
         let deleted_path = join_components(&components);
-        let parent = self.parent(node_id)?.ok_or_else(|| {
-            SyncError::InvalidState("tree index node is missing a parent".into())
-        })?;
+        let parent = self
+            .parent(node_id)?
+            .ok_or_else(|| SyncError::InvalidState("tree index node is missing a parent".into()))?;
         let name = self.node(node_id)?.name.clone();
         self.remove_child(parent, &name)?;
         self.remove_subtree(node_id);
@@ -252,9 +252,9 @@ impl TreeIndex {
             ));
         }
 
-        let old_parent = self.parent(node_id)?.ok_or_else(|| {
-            SyncError::InvalidState("tree index node is missing a parent".into())
-        })?;
+        let old_parent = self
+            .parent(node_id)?
+            .ok_or_else(|| SyncError::InvalidState("tree index node is missing a parent".into()))?;
         let old_name = self.node(node_id)?.name.clone();
         self.remove_child(old_parent, &old_name)?;
 
@@ -277,7 +277,11 @@ impl TreeIndex {
         changed_trees.extend(self.prune_and_rehash(old_parent)?);
         changed_trees.extend(self.rehash_ancestors(new_parent)?);
 
-        self.build_update(changed_trees, changed_files, vec![join_components(&from_components)])
+        self.build_update(
+            changed_trees,
+            changed_files,
+            vec![join_components(&from_components)],
+        )
     }
 
     /// Materialize the current indexed state into persisted metadata objects.
@@ -465,7 +469,10 @@ impl TreeIndex {
             });
         }
 
-        let mut tree = Tree { hash: [0; 32], entries };
+        let mut tree = Tree {
+            hash: [0; 32],
+            entries,
+        };
         tree.update_hash();
         Ok(tree)
     }
@@ -703,12 +710,23 @@ mod tests {
         let (root, objects) = nested_objects();
         let mut load_tree = |hash| load_tree_object(&objects, hash);
         let mut load_file = |hash| load_file_object(&objects, hash);
-        let index = TreeIndex::load_from_root(root.clone(), &mut load_tree, &mut load_file).unwrap();
+        let index =
+            TreeIndex::load_from_root(root.clone(), &mut load_tree, &mut load_file).unwrap();
 
         assert_eq!(index.resolve_path(Path::new("")).unwrap(), Some(index.root));
         assert!(index.resolve_path(Path::new("docs")).unwrap().is_some());
-        assert!(index.resolve_path(Path::new("docs/guide.md")).unwrap().is_some());
-        assert!(index.resolve_path(Path::new("missing.txt")).unwrap().is_none());
+        assert!(
+            index
+                .resolve_path(Path::new("docs/guide.md"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            index
+                .resolve_path(Path::new("missing.txt"))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(index.materialize_all().unwrap().root, root);
     }
 
@@ -717,10 +735,17 @@ mod tests {
         let mut index = TreeIndex::empty();
         let file = file("docs/guide.md", 1);
 
-        let update = index.upsert_file(Path::new("docs/guide.md"), file.clone()).unwrap();
+        let update = index
+            .upsert_file(Path::new("docs/guide.md"), file.clone())
+            .unwrap();
 
         assert!(index.resolve_path(Path::new("docs")).unwrap().is_some());
-        assert!(index.resolve_path(Path::new("docs/guide.md")).unwrap().is_some());
+        assert!(
+            index
+                .resolve_path(Path::new("docs/guide.md"))
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(update.files, vec![file.clone()]);
         assert_eq!(update.deleted_paths, Vec::<String>::new());
         assert_eq!(update.root, materialized_root(&index));
@@ -734,7 +759,12 @@ mod tests {
         let update = index.ensure_directory(Path::new("docs/guides")).unwrap();
 
         assert!(index.resolve_path(Path::new("docs")).unwrap().is_some());
-        assert!(index.resolve_path(Path::new("docs/guides")).unwrap().is_some());
+        assert!(
+            index
+                .resolve_path(Path::new("docs/guides"))
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(update.files, Vec::<File>::new());
         assert_eq!(update.deleted_paths, Vec::<String>::new());
         assert_eq!(update.root, materialized_root(&index));
@@ -764,7 +794,12 @@ mod tests {
         let update = index.remove_path(Path::new("docs/guide.md")).unwrap();
 
         assert!(index.resolve_path(Path::new("docs")).unwrap().is_none());
-        assert!(index.resolve_path(Path::new("docs/guide.md")).unwrap().is_none());
+        assert!(
+            index
+                .resolve_path(Path::new("docs/guide.md"))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(update.deleted_paths, vec!["docs/guide.md".to_string()]);
         assert_eq!(update.files, Vec::<File>::new());
         assert_eq!(update.root, Tree::empty());
@@ -784,7 +819,12 @@ mod tests {
 
         assert!(index.resolve_path(Path::new("docs")).unwrap().is_none());
         assert!(index.resolve_path(Path::new("guides")).unwrap().is_some());
-        assert!(index.resolve_path(Path::new("guides/guide.md")).unwrap().is_some());
+        assert!(
+            index
+                .resolve_path(Path::new("guides/guide.md"))
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(update.deleted_paths, vec!["docs".to_string()]);
         assert_eq!(update.files.len(), 1);
         assert_eq!(update.files[0].path, "guides/guide.md");

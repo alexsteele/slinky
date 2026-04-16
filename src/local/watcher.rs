@@ -2,7 +2,10 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher, recommended_watcher};
+use notify::{
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher,
+    recommended_watcher,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::services::{Result, SyncError, Watcher, WatcherEvent};
@@ -21,8 +24,8 @@ impl Watcher for FsWatcher {
         let root = std::fs::canonicalize(root)?;
         eprintln!("[watcher] watching {}", root.display());
         let tx = tx.clone();
-        let mut watcher: RecommendedWatcher = recommended_watcher(
-            move |result: notify::Result<notify::Event>| match result {
+        let mut watcher: RecommendedWatcher =
+            recommended_watcher(move |result: notify::Result<notify::Event>| match result {
                 Ok(event) => {
                     eprintln!("[watcher] notify event: {:?}", event);
                     for message in map_notify_event(event) {
@@ -34,9 +37,8 @@ impl Watcher for FsWatcher {
                     eprintln!("[watcher] notify error: {error}");
                     let _ = tx.blocking_send(WatcherEvent::RescanRequested);
                 }
-            },
-        )
-        .map_err(|err| SyncError::InvalidState(err.to_string()))?;
+            })
+            .map_err(|err| SyncError::InvalidState(err.to_string()))?;
 
         watcher
             .watch(&root, RecursiveMode::Recursive)
@@ -167,8 +169,9 @@ mod tests {
     #[test]
     fn maps_directory_create() {
         let path = PathBuf::from("/tmp/docs");
-        let events =
-            map_notify_event(Event::new(EventKind::Create(CreateKind::Folder)).add_path(path.clone()));
+        let events = map_notify_event(
+            Event::new(EventKind::Create(CreateKind::Folder)).add_path(path.clone()),
+        );
 
         assert_eq!(events, vec![WatcherEvent::DirectoryCreated(path)]);
     }

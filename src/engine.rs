@@ -99,7 +99,10 @@ impl SyncEngine {
                 if snapshot == other_snapshot {
                     continue;
                 }
-                if self.is_snapshot_ancestor(*snapshot, *other_snapshot).await? {
+                if self
+                    .is_snapshot_ancestor(*snapshot, *other_snapshot)
+                    .await?
+                {
                     dominated = true;
                     break;
                 }
@@ -167,7 +170,9 @@ impl SyncEngine {
             }
             SyncEvent::Local(WatcherEvent::FileDeleted(path)) => {
                 self.log(&format!("local file deleted: {}", path.display()));
-                self.sync_removed_path(&path, "local file delete").await.map(Some)
+                self.sync_removed_path(&path, "local file delete")
+                    .await
+                    .map(Some)
             }
             SyncEvent::Local(WatcherEvent::DirectoryCreated(path)) => {
                 self.log(&format!("local directory created: {}", path.display()));
@@ -175,7 +180,9 @@ impl SyncEngine {
             }
             SyncEvent::Local(WatcherEvent::DirectoryDeleted(path)) => {
                 self.log(&format!("local directory deleted: {}", path.display()));
-                self.sync_removed_path(&path, "local directory delete").await.map(Some)
+                self.sync_removed_path(&path, "local directory delete")
+                    .await
+                    .map(Some)
             }
             SyncEvent::Local(WatcherEvent::PathMoved { from, to }) => {
                 self.log(&format!(
@@ -215,10 +222,7 @@ impl SyncEngine {
         }
     }
 
-    async fn handle_remote_snapshot(
-        &mut self,
-        announcement: SnapshotAnnouncement,
-    ) -> Result<()> {
+    async fn handle_remote_snapshot(&mut self, announcement: SnapshotAnnouncement) -> Result<()> {
         if announcement.repo_id != self.config.repo_id {
             self.log(&format!(
                 "ignoring remote snapshot for different repo: {}",
@@ -260,6 +264,17 @@ impl SyncEngine {
             .frontier
             .device_snapshots
             .insert(announcement.device.clone(), snapshot.hash);
+
+        match self.next_remote_target().await? {
+            Some((device_id, target)) => {
+                self.log(&format!(
+                    "next remote reconcile target: {} {}",
+                    device_id,
+                    encode_hash(&target)
+                ));
+            }
+            None => self.log("no remote reconcile target after frontier update"),
+        }
 
         if snapshot.hash == self.state.snapshot {
             self.log("remote snapshot already matches local snapshot");
@@ -618,8 +633,8 @@ impl SyncEngine {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use async_trait::async_trait;
@@ -631,11 +646,11 @@ mod tests {
         Object, ObjectHash, ObjectId, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
         TreeEntry,
     };
-    use crate::local::{LocalChunker, build_snapshot};
     use crate::local::util::hash_bytes;
+    use crate::local::{LocalChunker, build_snapshot};
     use crate::services::{
-        BlobStore, Coordinator, CoordinatorNotification, CoordinatorNotificationStream,
-        MetaStore, ObjStore, Result, SyncError, TreeBuilder, WatcherEvent,
+        BlobStore, Coordinator, CoordinatorNotification, CoordinatorNotificationStream, MetaStore,
+        ObjStore, Result, SyncError, TreeBuilder, WatcherEvent,
     };
 
     struct MemoryMetaStore {
@@ -729,7 +744,10 @@ mod tests {
     #[async_trait]
     impl BlobStore for MemoryBlobStore {
         async fn put_blob(&self, blob: &FullBlob) -> Result<()> {
-            self.blobs.lock().unwrap().insert(blob.hash, blob.data.clone());
+            self.blobs
+                .lock()
+                .unwrap()
+                .insert(blob.hash, blob.data.clone());
             Ok(())
         }
 
@@ -765,7 +783,10 @@ mod tests {
         }
 
         fn insert_snapshot(&self, snapshot: Snapshot) {
-            self.snapshots.lock().unwrap().insert(snapshot.hash, snapshot);
+            self.snapshots
+                .lock()
+                .unwrap()
+                .insert(snapshot.hash, snapshot);
         }
 
         fn insert_change_set(&self, change_set: ChangeSet) {
@@ -792,7 +813,11 @@ mod tests {
             Ok(rx)
         }
 
-        async fn publish_snapshot(&self, snapshot: &Snapshot, change_set: &ChangeSet) -> Result<()> {
+        async fn publish_snapshot(
+            &self,
+            snapshot: &Snapshot,
+            change_set: &ChangeSet,
+        ) -> Result<()> {
             self.published
                 .lock()
                 .unwrap()
@@ -996,7 +1021,9 @@ mod tests {
         std::fs::write(&file_path, b"hello updated").unwrap();
         let before = engine.state.snapshot;
         let after = engine
-            .handle_event(super::SyncEvent::Local(WatcherEvent::FileChanged(file_path)))
+            .handle_event(super::SyncEvent::Local(WatcherEvent::FileChanged(
+                file_path,
+            )))
             .await
             .unwrap()
             .unwrap();
@@ -1113,12 +1140,20 @@ mod tests {
 
         assert_eq!(tree_builder.calls(), 1);
         assert_ne!(after, before);
-        assert!(engine
-            .index
-            .resolve_path(Path::new("docs/guide.md"))
-            .unwrap()
-            .is_none());
-        assert!(engine.index.resolve_path(Path::new("docs")).unwrap().is_none());
+        assert!(
+            engine
+                .index
+                .resolve_path(Path::new("docs/guide.md"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .index
+                .resolve_path(Path::new("docs"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1221,13 +1256,13 @@ mod tests {
         coordinator.insert_change_set(remote_change_set);
 
         engine
-            .handle_event(super::SyncEvent::Remote(
-                CoordinatorNotification::Snapshot(SnapshotAnnouncement {
+            .handle_event(super::SyncEvent::Remote(CoordinatorNotification::Snapshot(
+                SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: remote_snapshot.hash,
                     device: "peer-1".into(),
-                }),
-            ))
+                },
+            )))
             .await
             .unwrap();
 
@@ -1243,6 +1278,71 @@ mod tests {
                 .unwrap(),
             Object::Snapshot(_)
         ));
+        assert_eq!(
+            engine.next_remote_target().await.unwrap(),
+            Some(("peer-1".into(), remote_snapshot.hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_notification_selects_maximal_frontier_tip() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let base_snapshot = build_snapshot(&"peer-a".to_string(), [4; 32], Some(&[0; 32]));
+        let tip_snapshot =
+            build_snapshot(&"peer-b".to_string(), [5; 32], Some(&base_snapshot.hash));
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: [0; 32],
+            published_snapshot: [0; 32],
+            frontier: Frontier {
+                device_snapshots: BTreeMap::from([("peer-a".into(), base_snapshot.hash)]),
+            },
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::Snapshot(base_snapshot.clone()));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        coordinator.insert_snapshot(tip_snapshot.clone());
+        coordinator.insert_change_set(ChangeSet {
+            base: base_snapshot.hash,
+            target: tip_snapshot.hash,
+            diff: crate::core::TreeDiff {
+                entries: BTreeMap::new(),
+            },
+        });
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let mut engine = SyncEngine::open(
+            config.clone(),
+            meta_store,
+            obj_store,
+            blob_store,
+            coordinator,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        engine
+            .handle_event(super::SyncEvent::Remote(CoordinatorNotification::Snapshot(
+                SnapshotAnnouncement {
+                    repo_id: config.repo_id.clone(),
+                    snapshot: tip_snapshot.hash,
+                    device: "peer-b".into(),
+                },
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine.next_remote_target().await.unwrap(),
+            Some(("peer-b".into(), tip_snapshot.hash))
+        );
     }
 
     #[tokio::test]
@@ -1279,13 +1379,13 @@ mod tests {
         coordinator.insert_snapshot(remote_snapshot.clone());
 
         engine
-            .handle_event(super::SyncEvent::Remote(
-                CoordinatorNotification::Snapshot(SnapshotAnnouncement {
+            .handle_event(super::SyncEvent::Remote(CoordinatorNotification::Snapshot(
+                SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: remote_snapshot.hash,
                     device: config.device_id.clone(),
-                }),
-            ))
+                },
+            )))
             .await
             .unwrap();
 
@@ -1345,13 +1445,13 @@ mod tests {
         coordinator.insert_change_set(remote_change_set);
 
         engine
-            .handle_event(super::SyncEvent::Remote(
-                CoordinatorNotification::Snapshot(SnapshotAnnouncement {
+            .handle_event(super::SyncEvent::Remote(CoordinatorNotification::Snapshot(
+                SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: remote_snapshot.hash,
                     device: "peer-1".into(),
-                }),
-            ))
+                },
+            )))
             .await
             .unwrap();
 
@@ -1463,7 +1563,8 @@ mod tests {
 
         let (config, file, tree) = sample_config_and_tree(sync_root.clone());
         let base_snapshot = build_snapshot(&"peer-base".to_string(), [2; 32], Some(&[0; 32]));
-        let tip_snapshot = build_snapshot(&"peer-tip".to_string(), [3; 32], Some(&base_snapshot.hash));
+        let tip_snapshot =
+            build_snapshot(&"peer-tip".to_string(), [3; 32], Some(&base_snapshot.hash));
         let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
             snapshot: [0; 32],
             published_snapshot: [0; 32],
@@ -1481,7 +1582,9 @@ mod tests {
         obj_store.insert(Object::Snapshot(tip_snapshot.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
-        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree: Tree::empty() });
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder {
+            tree: Tree::empty(),
+        });
         let chunker = LocalChunker::open();
 
         let engine = SyncEngine::open(

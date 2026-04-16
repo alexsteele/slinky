@@ -77,7 +77,11 @@ impl SyncService {
             let (local_tx, mut local_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
             let forwarder = tokio::spawn(async move {
                 while let Some(event) = local_rx.recv().await {
-                    if watcher_event_tx.send(SyncEvent::Local(event)).await.is_err() {
+                    if watcher_event_tx
+                        .send(SyncEvent::Local(event))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }

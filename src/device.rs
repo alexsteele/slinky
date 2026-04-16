@@ -255,6 +255,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_watcher_updates_engine_tree_after_local_file_delete() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        std::fs::write(sync_root.join("docs/guide.md"), b"guide").unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config = Config {
+            sync_root: sync_root.clone(),
+            repo_id: format!("repo-{unique}"),
+            device_id: format!("device-{unique}"),
+            credentials: DeviceCredentials {
+                public_key: "pub".into(),
+                private_key_path: dir.path().join("device.key"),
+            },
+        };
+
+        let mut device = Device::open(config).await.unwrap();
+        device.start().await.unwrap();
+
+        let meta_store = LocalMetaStore::open(device.config.clone()).unwrap();
+        let initial_state = meta_store
+            .load_state(&device.config.repo_id, &device.config.device_id)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(sync_root.join("docs/guide.md")).unwrap();
+        let updated_snapshot =
+            wait_for_snapshot_change(&device, meta_store.clone(), initial_state.snapshot).await;
+
+        device.stop().await.unwrap();
+        device.join().await.unwrap();
+
+        let engine = device.service.engine.as_ref().unwrap();
+        assert_eq!(engine.state.snapshot, updated_snapshot);
+        assert!(engine
+            .index
+            .resolve_path(std::path::Path::new("docs/guide.md"))
+            .unwrap()
+            .is_none());
+        assert!(engine
+            .index
+            .resolve_path(std::path::Path::new("docs"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn device_watcher_updates_engine_tree_after_empty_directory_delete() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        std::fs::write(sync_root.join("hello.txt"), b"hello").unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config = Config {
+            sync_root: sync_root.clone(),
+            repo_id: format!("repo-{unique}"),
+            device_id: format!("device-{unique}"),
+            credentials: DeviceCredentials {
+                public_key: "pub".into(),
+                private_key_path: dir.path().join("device.key"),
+            },
+        };
+
+        let mut device = Device::open(config).await.unwrap();
+        device.start().await.unwrap();
+
+        let meta_store = LocalMetaStore::open(device.config.clone()).unwrap();
+        let initial_state = meta_store
+            .load_state(&device.config.repo_id, &device.config.device_id)
+            .await
+            .unwrap();
+
+        std::fs::remove_dir(sync_root.join("docs")).unwrap();
+        sleep(Duration::from_millis(500)).await;
+
+        device.stop().await.unwrap();
+        device.join().await.unwrap();
+
+        let engine = device.service.engine.as_ref().unwrap();
+        assert_eq!(engine.state.snapshot, initial_state.snapshot);
+        assert!(engine
+            .index
+            .resolve_path(std::path::Path::new("docs"))
+            .unwrap()
+            .is_none());
+        assert!(engine
+            .tree
+            .entries
+            .iter()
+            .any(|entry| entry.name == "hello.txt" && entry.kind == FileKind::File));
+    }
+
+    #[tokio::test]
     async fn device_watcher_updates_engine_tree_after_local_move() {
         let dir = tempdir().unwrap();
         let sync_root = dir.path().join("sync");

@@ -865,6 +865,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_delete_updates_tree_without_rebuild() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        let file_path = sync_root.join("docs/guide.md");
+        std::fs::write(&file_path, b"guide").unwrap();
+
+        let (config, file, docs_tree, root_tree) = sample_nested_config_and_tree(sync_root.clone());
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: [0; 32],
+            published_snapshot: [0; 32],
+            frontier: Frontier::default(),
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::File(file));
+        obj_store.insert(Object::Tree(docs_tree));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(root_tree.clone()));
+        let chunker = LocalChunker::open();
+
+        let mut engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            coordinator,
+            tree_builder.clone(),
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        engine.start().await.unwrap();
+        assert_eq!(tree_builder.calls(), 1);
+
+        std::fs::remove_file(&file_path).unwrap();
+        let before = engine.state.snapshot;
+        let after = engine
+            .handle_event(super::SyncEvent::Local(WatcherEvent::FileDeleted(
+                file_path.clone(),
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(tree_builder.calls(), 1);
+        assert_ne!(after, before);
+        assert!(engine
+            .index
+            .resolve_path(Path::new("docs/guide.md"))
+            .unwrap()
+            .is_none());
+        assert!(engine.index.resolve_path(Path::new("docs")).unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn move_updates_metadata_without_restaging_blob() {
         let dir = tempdir().unwrap();
         let sync_root = dir.path().join("sync");

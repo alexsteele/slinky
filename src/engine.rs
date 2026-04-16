@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::{
-    BlobHash, ChangeSet, Config, DeviceState, File, Object, ObjectId, Snapshot, SnapshotHash,
-    Tree, TreeDiff,
+    BlobHash, ChangeSet, Config, DeviceState, File, Object, ObjectId, Snapshot,
+    SnapshotAnnouncement, SnapshotHash, Tree, TreeDiff,
 };
 use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
@@ -143,10 +143,76 @@ impl SyncEngine {
                 Ok(Some(self.full_sync("local rescan").await?))
             }
             SyncEvent::Remote(notification) => {
-                self.log(&format!("remote event received: {notification:?}"));
+                self.handle_remote_notification(notification).await?;
                 Ok(None)
             }
         }
+    }
+
+    async fn handle_remote_notification(
+        &mut self,
+        notification: CoordinatorNotification,
+    ) -> Result<()> {
+        match notification {
+            CoordinatorNotification::Snapshot(announcement) => {
+                self.handle_remote_snapshot(announcement).await
+            }
+            CoordinatorNotification::PeerAvailable(peer) => {
+                self.log(&format!("peer available: {:?}", peer));
+                self.state
+                    .frontier
+                    .device_snapshots
+                    .insert(peer.device, peer.snapshot);
+                Ok(())
+            }
+        }
+    }
+
+    async fn handle_remote_snapshot(
+        &mut self,
+        announcement: SnapshotAnnouncement,
+    ) -> Result<()> {
+        if announcement.repo_id != self.config.repo_id {
+            self.log(&format!(
+                "ignoring remote snapshot for different repo: {}",
+                announcement.repo_id
+            ));
+            return Ok(());
+        }
+
+        if announcement.device == self.config.device_id {
+            self.log("ignoring remote snapshot from local device");
+            return Ok(());
+        }
+
+        self.log(&format!(
+            "remote snapshot announced by {}: {}",
+            announcement.device,
+            encode_hash(&announcement.snapshot)
+        ));
+
+        let snapshot = self
+            .coordinator
+            .fetch_snapshot(&self.config.repo_id, &announcement.snapshot)
+            .await?;
+        let base = snapshot.parents.first().copied().unwrap_or([0; 32]);
+        let change_set = self
+            .coordinator
+            .fetch_change_set(&self.config.repo_id, &base, &snapshot.hash)
+            .await?;
+
+        self.log(&format!(
+            "fetched remote snapshot {} with base {}",
+            encode_hash(&snapshot.hash),
+            encode_hash(&change_set.base)
+        ));
+        self.log("remote reconcile/apply is not wired yet");
+
+        self.state
+            .frontier
+            .device_snapshots
+            .insert(announcement.device, snapshot.hash);
+        Ok(())
     }
 
     async fn full_sync(&mut self, reason: &str) -> Result<SnapshotHash> {
@@ -454,13 +520,14 @@ mod tests {
     use super::SyncEngine;
     use crate::core::{
         ChangeSet, Config, DeviceCredentials, DeviceState, File, FileKind, Frontier, FullBlob,
-        Object, ObjectHash, ObjectId, Snapshot, SnapshotHash, Tree, TreeEntry,
+        Object, ObjectHash, ObjectId, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
+        TreeEntry,
     };
     use crate::local::{LocalChunker, build_snapshot};
     use crate::local::util::hash_bytes;
     use crate::services::{
-        BlobStore, Coordinator, CoordinatorNotificationStream, MetaStore, ObjStore, Result,
-        SyncError, TreeBuilder, WatcherEvent,
+        BlobStore, Coordinator, CoordinatorNotification, CoordinatorNotificationStream,
+        MetaStore, ObjStore, Result, SyncError, TreeBuilder, WatcherEvent,
     };
 
     struct MemoryMetaStore {
@@ -575,6 +642,8 @@ mod tests {
     struct MemoryCoordinator {
         register_calls: Mutex<usize>,
         published: Mutex<Vec<(Snapshot, ChangeSet)>>,
+        snapshots: Mutex<BTreeMap<[u8; 32], Snapshot>>,
+        change_sets: Mutex<BTreeMap<([u8; 32], [u8; 32]), ChangeSet>>,
     }
 
     impl MemoryCoordinator {
@@ -582,7 +651,20 @@ mod tests {
             Self {
                 register_calls: Mutex::new(0),
                 published: Mutex::new(Vec::new()),
+                snapshots: Mutex::new(BTreeMap::new()),
+                change_sets: Mutex::new(BTreeMap::new()),
             }
+        }
+
+        fn insert_snapshot(&self, snapshot: Snapshot) {
+            self.snapshots.lock().unwrap().insert(snapshot.hash, snapshot);
+        }
+
+        fn insert_change_set(&self, change_set: ChangeSet) {
+            self.change_sets
+                .lock()
+                .unwrap()
+                .insert((change_set.base, change_set.target), change_set);
         }
     }
 
@@ -610,17 +692,27 @@ mod tests {
             Ok(())
         }
 
-        async fn fetch_snapshot(&self, _repo_id: &String, _hash: &SnapshotHash) -> Result<Snapshot> {
-            Err(SyncError::NotFound)
+        async fn fetch_snapshot(&self, _repo_id: &String, hash: &SnapshotHash) -> Result<Snapshot> {
+            self.snapshots
+                .lock()
+                .unwrap()
+                .get(hash)
+                .cloned()
+                .ok_or(SyncError::NotFound)
         }
 
         async fn fetch_change_set(
             &self,
             _repo_id: &String,
-            _base: &SnapshotHash,
-            _target: &SnapshotHash,
+            base: &SnapshotHash,
+            target: &SnapshotHash,
         ) -> Result<ChangeSet> {
-            Err(SyncError::NotFound)
+            self.change_sets
+                .lock()
+                .unwrap()
+                .get(&(*base, *target))
+                .cloned()
+                .ok_or(SyncError::NotFound)
         }
 
         async fn fetch_frontier(&self, _repo_id: &String) -> Result<Frontier> {
@@ -977,6 +1069,111 @@ mod tests {
         assert_eq!(tree_builder.calls(), 1);
         assert_ne!(after, before);
         assert_eq!(blob_store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_notification_fetches_metadata_and_updates_frontier() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: [0; 32],
+            published_snapshot: [0; 32],
+            frontier: Frontier::default(),
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let mut engine = SyncEngine::open(
+            config.clone(),
+            meta_store,
+            obj_store,
+            blob_store,
+            coordinator.clone(),
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        let remote_snapshot = build_snapshot(&"peer-1".to_string(), [7; 32], Some(&[0; 32]));
+        let remote_change_set = ChangeSet {
+            base: [0; 32],
+            target: remote_snapshot.hash,
+            diff: crate::core::TreeDiff {
+                entries: BTreeMap::new(),
+            },
+        };
+        coordinator.insert_snapshot(remote_snapshot.clone());
+        coordinator.insert_change_set(remote_change_set);
+
+        engine
+            .handle_event(super::SyncEvent::Remote(
+                CoordinatorNotification::Snapshot(SnapshotAnnouncement {
+                    repo_id: config.repo_id.clone(),
+                    snapshot: remote_snapshot.hash,
+                    device: "peer-1".into(),
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine.state.frontier.device_snapshots.get("peer-1"),
+            Some(&remote_snapshot.hash)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_notification_ignores_local_device() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: [0; 32],
+            published_snapshot: [0; 32],
+            frontier: Frontier::default(),
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let mut engine = SyncEngine::open(
+            config.clone(),
+            meta_store,
+            obj_store,
+            blob_store,
+            coordinator.clone(),
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        let remote_snapshot = build_snapshot(&config.device_id, [7; 32], Some(&[0; 32]));
+        coordinator.insert_snapshot(remote_snapshot.clone());
+
+        engine
+            .handle_event(super::SyncEvent::Remote(
+                CoordinatorNotification::Snapshot(SnapshotAnnouncement {
+                    repo_id: config.repo_id.clone(),
+                    snapshot: remote_snapshot.hash,
+                    device: config.device_id.clone(),
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert!(engine.state.frontier.device_snapshots.is_empty());
     }
 
     fn sample_config_and_tree(sync_root: PathBuf) -> (Config, File, Tree) {

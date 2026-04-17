@@ -3,12 +3,13 @@ use std::sync::Arc;
 use crate::core::Config;
 use crate::engine::SyncEngine;
 use crate::local::{
-    FsWatcher, LocalBlobStore, LocalChunker, LocalMetaStore, LocalObjStore, LocalTreeBuilder,
-    NoopCoordinator, load_config,
+    FsWatcher, LocalApplier, LocalBlobStore, LocalBlobTransferWorker, LocalChunker, LocalMetaStore,
+    LocalObjStore, LocalTreeBuilder, NoopCoordinator, load_config,
 };
 use crate::runtime::SyncService;
 use crate::services::{
-    BlobStore, Chunker, Coordinator, MetaStore, ObjStore, Result, TreeBuilder, Watcher,
+    Applier, BlobStore, BlobTransferWorker, Chunker, Coordinator, MetaStore, ObjStore, Result,
+    TreeBuilder, Watcher,
 };
 
 /// Device is the top-level assembled local node.
@@ -27,6 +28,8 @@ impl Device {
     pub async fn open(config: Config) -> Result<Self> {
         let meta_store = Self::open_meta_store(&config).await?;
         let blob_store = Self::open_blob_store(&config).await?;
+        let blob_worker = Self::open_blob_worker(blob_store.clone()).await?;
+        let applier = Self::open_applier(&config, blob_store.clone()).await?;
         let obj_store = Self::open_obj_store(&config).await?;
         let coordinator = Self::connect_coordinator(&config).await?;
         let chunker = Self::open_chunker().await?;
@@ -38,6 +41,8 @@ impl Device {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder,
             chunker,
@@ -84,6 +89,22 @@ impl Device {
 
     async fn connect_coordinator(_config: &Config) -> Result<Arc<dyn Coordinator>> {
         Ok(Arc::new(NoopCoordinator))
+    }
+
+    async fn open_blob_worker(
+        blob_store: Arc<dyn BlobStore>,
+    ) -> Result<Arc<dyn BlobTransferWorker>> {
+        Ok(Arc::new(LocalBlobTransferWorker::new(blob_store)))
+    }
+
+    async fn open_applier(
+        config: &Config,
+        blob_store: Arc<dyn BlobStore>,
+    ) -> Result<Arc<dyn Applier>> {
+        Ok(Arc::new(LocalApplier::new(
+            config.sync_root.clone(),
+            blob_store,
+        )))
     }
 
     async fn open_chunker() -> Result<Arc<dyn Chunker>> {

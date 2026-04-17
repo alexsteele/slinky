@@ -16,8 +16,8 @@ use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
 use crate::local::util::{encode_hash, walk_files};
 use crate::services::{
-    ApplyOp, ApplyPlan, BlobStore, Chunker, Coordinator, CoordinatorNotification, MetaStore,
-    ObjStore, Result, TreeBuilder, WatcherEvent,
+    Applier, ApplyOp, ApplyPlan, BlobStore, BlobTransferWorker, Chunker, Coordinator,
+    CoordinatorNotification, MetaStore, ObjStore, Result, TreeBuilder, WatcherEvent,
 };
 
 /// Serialized device-side sync state machine.
@@ -33,6 +33,8 @@ pub struct SyncEngine {
     pub meta_store: Arc<dyn MetaStore>,
     pub obj_store: Arc<dyn ObjStore>,
     pub blob_store: Arc<dyn BlobStore>,
+    pub blob_worker: Arc<dyn BlobTransferWorker>,
+    pub applier: Arc<dyn Applier>,
     pub coordinator: Arc<dyn Coordinator>,
     pub tree_builder: Arc<dyn TreeBuilder>,
     pub chunker: Arc<dyn Chunker>,
@@ -136,6 +138,8 @@ impl SyncEngine {
         meta_store: Arc<dyn MetaStore>,
         obj_store: Arc<dyn ObjStore>,
         blob_store: Arc<dyn BlobStore>,
+        blob_worker: Arc<dyn BlobTransferWorker>,
+        applier: Arc<dyn Applier>,
         coordinator: Arc<dyn Coordinator>,
         tree_builder: Arc<dyn TreeBuilder>,
         chunker: Arc<dyn Chunker>,
@@ -157,6 +161,8 @@ impl SyncEngine {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder,
             chunker,
@@ -289,6 +295,9 @@ impl SyncEngine {
                     )),
                     None => self.log("remote reconcile target is not directly applicable yet"),
                 }
+                if self.apply_next_remote_target().await? {
+                    self.log("remote reconcile apply complete");
+                }
             }
             None => self.log("no remote reconcile target after frontier update"),
         }
@@ -308,7 +317,6 @@ impl SyncEngine {
             encode_hash(&snapshot.hash),
             announcement.device
         ));
-        self.log("remote reconcile/apply is not wired yet");
         Ok(())
     }
 
@@ -343,6 +351,41 @@ impl SyncEngine {
         }
 
         Ok(Some(Self::build_apply_plan(target, &change_set.diff)))
+    }
+
+    /// Applies the next fast-forward remote target and advances local state on success.
+    async fn apply_next_remote_target(&mut self) -> Result<bool> {
+        let Some((device_id, target)) = self.next_remote_target().await? else {
+            return Ok(false);
+        };
+        let Some(plan) = self.plan_remote_reconcile(&device_id, target).await? else {
+            return Ok(false);
+        };
+        let snapshot = self.load_snapshot(target).await?;
+
+        self.ensure_plan_blobs(&plan).await?;
+        self.applier.apply(&plan).await?;
+
+        let tree = self.tree_builder.build_tree(&self.config.sync_root).await?;
+        if tree.hash != snapshot.tree_hash {
+            return Err(crate::services::SyncError::InvalidState(
+                "applied tree does not match target snapshot".into(),
+            ));
+        }
+
+        self.obj_store
+            .save_object(&Object::Tree(tree.clone()))
+            .await?;
+        self.index = self.build_index_from_disk().await?;
+        self.tree = tree;
+        self.state.snapshot = snapshot.hash;
+        self.save_state().await?;
+        self.log(&format!(
+            "applied remote snapshot {} from {}",
+            encode_hash(&snapshot.hash),
+            device_id
+        ));
+        Ok(true)
     }
 
     async fn full_sync(&mut self, reason: &str) -> Result<SnapshotHash> {
@@ -533,6 +576,44 @@ impl SyncEngine {
         path.strip_prefix(&self.config.sync_root)
             .ok()
             .map(Path::to_path_buf)
+    }
+
+    /// Ensures blob content for file writes in a plan is available locally.
+    async fn ensure_plan_blobs(&self, plan: &ApplyPlan) -> Result<()> {
+        let mut blobs = Vec::new();
+        let mut seen = BTreeSet::new();
+        for op in &plan.ops {
+            let ApplyOp::WriteFile { file, .. } = op else {
+                continue;
+            };
+            for blob in &file.blobs {
+                if self.blob_store.has_blob(blob).await? || !seen.insert(*blob) {
+                    continue;
+                }
+                blobs.push(*blob);
+            }
+        }
+
+        if blobs.is_empty() {
+            return Ok(());
+        }
+
+        let result = self
+            .blob_worker
+            .download_blobs(&BlobTransferJob {
+                snapshot: plan.target_snapshot,
+                blobs: blobs.clone(),
+            })
+            .await?;
+
+        let downloaded: BTreeSet<_> = result.blobs.into_iter().collect();
+        for blob in blobs {
+            if !downloaded.contains(&blob) || !self.blob_store.has_blob(&blob).await? {
+                return Err(crate::services::SyncError::NotFound);
+            }
+        }
+
+        Ok(())
     }
 
     /// Converts a tree diff into a simple apply plan.
@@ -769,10 +850,11 @@ mod tests {
         TreeChange, TreeDiff, TreeEntry,
     };
     use crate::local::util::hash_bytes;
-    use crate::local::{LocalChunker, build_snapshot};
+    use crate::local::{LocalApplier, LocalChunker, build_snapshot};
     use crate::services::{
-        ApplyOp, BlobStore, Coordinator, CoordinatorNotification, CoordinatorNotificationStream,
-        MetaStore, ObjStore, Result, SyncError, TreeBuilder, WatcherEvent,
+        Applier, ApplyOp, ApplyPlan, BlobStore, BlobTransferWorker, Coordinator,
+        CoordinatorNotification, CoordinatorNotificationStream, MetaStore, ObjStore, Result,
+        SyncError, TreeBuilder, WatcherEvent,
     };
 
     struct MemoryMetaStore {
@@ -885,6 +967,106 @@ mod tests {
         async fn has_blob(&self, hash: &[u8; 32]) -> Result<bool> {
             Ok(self.blobs.lock().unwrap().contains_key(hash))
         }
+    }
+
+    struct MemoryApplier;
+
+    #[async_trait]
+    impl Applier for MemoryApplier {
+        async fn apply(&self, _plan: &ApplyPlan) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MemoryBlobTransferWorker {
+        blob_store: std::sync::Arc<dyn BlobStore>,
+    }
+
+    impl MemoryBlobTransferWorker {
+        fn new(blob_store: std::sync::Arc<dyn BlobStore>) -> Self {
+            Self { blob_store }
+        }
+    }
+
+    #[async_trait]
+    impl BlobTransferWorker for MemoryBlobTransferWorker {
+        async fn upload_blobs(
+            &self,
+            job: &super::BlobTransferJob,
+        ) -> Result<super::BlobTransferResult> {
+            Ok(super::BlobTransferResult {
+                snapshot: job.snapshot,
+                blobs: job.blobs.clone(),
+            })
+        }
+
+        async fn download_blobs(
+            &self,
+            job: &super::BlobTransferJob,
+        ) -> Result<super::BlobTransferResult> {
+            let mut present = Vec::new();
+            for blob in &job.blobs {
+                if self.blob_store.has_blob(blob).await? {
+                    present.push(*blob);
+                }
+            }
+            Ok(super::BlobTransferResult {
+                snapshot: job.snapshot,
+                blobs: present,
+            })
+        }
+    }
+
+    struct SeededBlobTransferWorker {
+        blob_store: std::sync::Arc<dyn BlobStore>,
+        blobs: BTreeMap<[u8; 32], Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl BlobTransferWorker for SeededBlobTransferWorker {
+        async fn upload_blobs(
+            &self,
+            job: &super::BlobTransferJob,
+        ) -> Result<super::BlobTransferResult> {
+            Ok(super::BlobTransferResult {
+                snapshot: job.snapshot,
+                blobs: job.blobs.clone(),
+            })
+        }
+
+        async fn download_blobs(
+            &self,
+            job: &super::BlobTransferJob,
+        ) -> Result<super::BlobTransferResult> {
+            let mut downloaded = Vec::new();
+            for blob in &job.blobs {
+                let Some(data) = self.blobs.get(blob) else {
+                    continue;
+                };
+                self.blob_store
+                    .put_blob(&crate::core::FullBlob {
+                        hash: *blob,
+                        size: data.len() as u64,
+                        data: data.clone(),
+                    })
+                    .await?;
+                downloaded.push(*blob);
+            }
+            Ok(super::BlobTransferResult {
+                snapshot: job.snapshot,
+                blobs: downloaded,
+            })
+        }
+    }
+
+    fn test_blob_worker(
+        blob_store: std::sync::Arc<dyn BlobStore>,
+    ) -> std::sync::Arc<dyn BlobTransferWorker> {
+        std::sync::Arc::new(MemoryBlobTransferWorker::new(blob_store))
+    }
+
+    fn test_applier() -> std::sync::Arc<dyn Applier> {
+        std::sync::Arc::new(MemoryApplier)
     }
 
     struct MemoryCoordinator {
@@ -1028,6 +1210,8 @@ mod tests {
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree: tree.clone() });
         let chunker = LocalChunker::open();
@@ -1037,6 +1221,8 @@ mod tests {
             meta_store.clone(),
             obj_store.clone(),
             blob_store.clone(),
+            blob_worker,
+            applier,
             coordinator.clone(),
             tree_builder,
             chunker,
@@ -1082,6 +1268,8 @@ mod tests {
         obj_store.insert(Object::Tree(tree.clone()));
         obj_store.insert(Object::Snapshot(snapshot.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree: tree.clone() });
         let chunker = LocalChunker::open();
@@ -1091,6 +1279,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator.clone(),
             tree_builder,
             chunker,
@@ -1121,6 +1311,8 @@ mod tests {
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(tree.clone()));
         let chunker = LocalChunker::open();
@@ -1130,6 +1322,8 @@ mod tests {
             meta_store,
             obj_store.clone(),
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder.clone(),
             chunker,
@@ -1179,6 +1373,8 @@ mod tests {
         obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(docs_tree));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(root_tree.clone()));
         let chunker = LocalChunker::open();
@@ -1188,6 +1384,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder.clone(),
             chunker,
@@ -1231,6 +1429,8 @@ mod tests {
         obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(docs_tree));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(root_tree.clone()));
         let chunker = LocalChunker::open();
@@ -1240,6 +1440,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder.clone(),
             chunker,
@@ -1296,6 +1498,8 @@ mod tests {
         obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(docs_tree));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(root_tree.clone()));
         let chunker = LocalChunker::open();
@@ -1305,6 +1509,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store.clone(),
+            blob_worker,
+            applier,
             coordinator,
             tree_builder.clone(),
             chunker,
@@ -1342,7 +1548,7 @@ mod tests {
         let sync_root = dir.path().join("sync");
         std::fs::create_dir_all(&sync_root).unwrap();
 
-        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let (config, _file, _tree) = sample_config_and_tree(sync_root.clone());
         let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
             snapshot: [0; 32],
             published_snapshot: [0; 32],
@@ -1350,8 +1556,12 @@ mod tests {
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
-        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder {
+            tree: Tree::empty(),
+        });
         let chunker = LocalChunker::open();
 
         let mut engine = SyncEngine::open(
@@ -1359,6 +1569,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator.clone(),
             tree_builder,
             chunker,
@@ -1366,7 +1578,8 @@ mod tests {
         .await
         .unwrap();
 
-        let remote_snapshot = build_snapshot(&"peer-1".to_string(), [7; 32], Some(&[0; 32]));
+        let remote_snapshot =
+            build_snapshot(&"peer-1".to_string(), Tree::empty().hash, Some(&[0; 32]));
         let remote_change_set = ChangeSet {
             base: [0; 32],
             target: remote_snapshot.hash,
@@ -1400,10 +1613,7 @@ mod tests {
                 .unwrap(),
             Object::Snapshot(_)
         ));
-        assert_eq!(
-            engine.next_remote_target().await.unwrap(),
-            Some(("peer-1".into(), remote_snapshot.hash))
-        );
+        assert_eq!(engine.next_remote_target().await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1426,6 +1636,8 @@ mod tests {
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::Snapshot(base_snapshot.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         coordinator.insert_snapshot(tip_snapshot.clone());
         coordinator.insert_change_set(ChangeSet {
@@ -1443,6 +1655,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder,
             chunker,
@@ -1503,6 +1717,8 @@ mod tests {
         obj_store.insert(Object::Snapshot(base_snapshot.clone()));
         obj_store.insert(Object::Snapshot(target_snapshot.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         coordinator.insert_change_set(ChangeSet {
             base: base_snapshot.hash,
@@ -1517,6 +1733,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder,
             chunker,
@@ -1571,6 +1789,8 @@ mod tests {
         obj_store.insert(Object::Snapshot(local_snapshot));
         obj_store.insert(Object::Snapshot(remote_tip));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();
@@ -1580,6 +1800,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder,
             chunker,
@@ -1588,6 +1810,114 @@ mod tests {
         .unwrap();
 
         assert_eq!(engine.reconcile_next_remote_target().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_notification_applies_fast_forward_target() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, _tree) = sample_config_and_tree(sync_root.clone());
+        let base_snapshot = build_snapshot(&config.device_id, Tree::empty().hash, Some(&[0; 32]));
+        let docs_blob = hash_bytes(b"remote docs");
+        let mut docs_file = File {
+            path: "docs/readme.txt".into(),
+            hash: [0; 32],
+            blobs: vec![docs_blob],
+        };
+        docs_file.update_hash();
+        let mut target_tree = Tree {
+            hash: [0; 32],
+            entries: vec![TreeEntry {
+                name: "docs".into(),
+                kind: FileKind::Folder,
+                hash: ObjectHash::Tree({
+                    let mut docs_tree = Tree {
+                        hash: [0; 32],
+                        entries: vec![TreeEntry {
+                            name: "readme.txt".into(),
+                            kind: FileKind::File,
+                            hash: ObjectHash::File(docs_file.hash),
+                        }],
+                    };
+                    docs_tree.update_hash();
+                    docs_tree.hash
+                }),
+            }],
+        };
+        target_tree.update_hash();
+        let target_snapshot = build_snapshot(
+            &"peer-1".to_string(),
+            target_tree.hash,
+            Some(&base_snapshot.hash),
+        );
+        let mut diff = TreeDiff {
+            entries: BTreeMap::new(),
+        };
+        diff.insert_path(
+            Path::new("docs/readme.txt"),
+            TreeChange::File(docs_file.clone()),
+        );
+
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: base_snapshot.hash,
+            published_snapshot: base_snapshot.hash,
+            frontier: Frontier::default(),
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::Tree(Tree::empty()));
+        obj_store.insert(Object::Snapshot(base_snapshot.clone()));
+        obj_store.insert(Object::Snapshot(target_snapshot.clone()));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = std::sync::Arc::new(SeededBlobTransferWorker {
+            blob_store: blob_store.clone(),
+            blobs: BTreeMap::from([(docs_blob, b"remote docs".to_vec())]),
+        });
+        let applier = std::sync::Arc::new(LocalApplier::new(sync_root.clone(), blob_store.clone()));
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        coordinator.insert_snapshot(target_snapshot.clone());
+        coordinator.insert_change_set(ChangeSet {
+            base: base_snapshot.hash,
+            target: target_snapshot.hash,
+            diff,
+        });
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder {
+            tree: target_tree.clone(),
+        });
+        let chunker = LocalChunker::open();
+
+        let mut engine = SyncEngine::open(
+            config.clone(),
+            meta_store,
+            obj_store,
+            blob_store,
+            blob_worker,
+            applier,
+            coordinator,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        engine
+            .handle_event(super::SyncEvent::Remote(CoordinatorNotification::Snapshot(
+                SnapshotAnnouncement {
+                    repo_id: config.repo_id.clone(),
+                    snapshot: target_snapshot.hash,
+                    device: "peer-1".into(),
+                },
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.state.snapshot, target_snapshot.hash);
+        assert_eq!(engine.tree.hash, target_tree.hash);
+        assert_eq!(
+            std::fs::read_to_string(sync_root.join("docs/readme.txt")).unwrap(),
+            "remote docs"
+        );
     }
 
     #[tokio::test]
@@ -1604,6 +1934,8 @@ mod tests {
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();
@@ -1613,6 +1945,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator.clone(),
             tree_builder,
             chunker,
@@ -1656,6 +1990,8 @@ mod tests {
         obj_store.insert(Object::Tree(tree.clone()));
         obj_store.insert(Object::Snapshot(local_snapshot.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();
@@ -1665,6 +2001,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator.clone(),
             tree_builder,
             chunker,
@@ -1733,6 +2071,8 @@ mod tests {
         obj_store.insert(Object::Tree(tree.clone()));
         obj_store.insert(Object::Snapshot(local_snapshot.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();
@@ -1742,6 +2082,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder,
             chunker,
@@ -1778,6 +2120,8 @@ mod tests {
         obj_store.insert(Object::Snapshot(snapshot_a.clone()));
         obj_store.insert(Object::Snapshot(snapshot_b.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();
@@ -1787,6 +2131,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder,
             chunker,
@@ -1826,6 +2172,8 @@ mod tests {
         obj_store.insert(Object::Snapshot(base_snapshot.clone()));
         obj_store.insert(Object::Snapshot(tip_snapshot.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
         let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder {
             tree: Tree::empty(),
@@ -1837,6 +2185,8 @@ mod tests {
             meta_store,
             obj_store,
             blob_store,
+            blob_worker,
+            applier,
             coordinator,
             tree_builder,
             chunker,

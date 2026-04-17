@@ -23,4 +23,4 @@ pub use scanner::FsScanner;
 pub use snapshot::build_snapshot;
 pub use tree::LocalTreeBuilder;
 pub use watcher::{FsWatcher, NoopWatcher};
-pub use worker::{LocalBlobTransferWorker, NoopApplier};
+pub use worker::{LocalApplier, LocalBlobTransferWorker, NoopApplier};

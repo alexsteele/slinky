@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::core::{
     Blob, BlobHash, ChangeSet, Checkpoint, CheckpointAnnouncement, Config, Delta,
-    DeltaAnnouncement, DeviceId, DeviceState, File, Frontier, FullBlob, Object, ObjectId,
-    PeerState, RepoId, SeqNo, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
+    DeltaAnnouncement, DeltaWindow, DeviceId, DeviceState, File, Frontier, FullBlob, Object,
+    ObjectId, PeerState, RepoId, SeqNo, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
 };
 use crate::engine::{ApplyJob, BlobTransferJob, BlobTransferResult};
 
@@ -73,6 +73,16 @@ pub trait Coordinator: Send + Sync {
         _to_inclusive: SeqNo,
     ) -> Result<Vec<Delta>> {
         Ok(Vec::new())
+    }
+
+    /// Fetch deltas for one replay window using `(from, to]` semantics.
+    async fn fetch_delta_window(
+        &self,
+        repo_id: &RepoId,
+        window: &DeltaWindow,
+    ) -> Result<Vec<Delta>> {
+        self.fetch_deltas(repo_id, window.from_exclusive, window.to_inclusive)
+            .await
     }
 
     /// Fetch the latest checkpoint at or before the requested seqno.

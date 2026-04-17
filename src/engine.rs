@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::{
-    BlobHash, ChangeSet, Config, DeviceId, DeviceState, File, Object, ObjectId, Snapshot,
-    SnapshotAnnouncement, SnapshotHash, Tree, TreeDiff,
+    BlobHash, ChangeSet, Config, DeltaWindow, DeviceId, DeviceState, File, Object, ObjectId,
+    Snapshot, SnapshotAnnouncement, SnapshotHash, Tree, TreeDiff,
 };
 use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
@@ -74,6 +74,33 @@ pub enum SyncEvent {
 }
 
 impl SyncEngine {
+    /// Returns the replay window needed to advance from one applied seqno to a newer head.
+    pub fn delta_window(
+        from_exclusive: crate::core::SeqNo,
+        to_inclusive: crate::core::SeqNo,
+    ) -> Option<DeltaWindow> {
+        if to_inclusive <= from_exclusive {
+            return None;
+        }
+
+        Some(DeltaWindow {
+            from_exclusive,
+            to_inclusive,
+        })
+    }
+
+    /// Fetches the coordinator head and derives the replay window after one applied seqno.
+    pub async fn delta_window_to_head(
+        &self,
+        applied_seqno: crate::core::SeqNo,
+    ) -> Result<Option<DeltaWindow>> {
+        let head_seqno = self
+            .coordinator
+            .fetch_head_seqno(&self.config.repo_id)
+            .await?;
+        Ok(Self::delta_window(applied_seqno, head_seqno))
+    }
+
     /// Returns the known remote tips that differ from the current local snapshot.
     fn candidate_remote_tip_set(&self) -> Vec<(DeviceId, SnapshotHash)> {
         let mut tips = Vec::new();
@@ -1088,6 +1115,7 @@ mod tests {
         published: Mutex<Vec<(Snapshot, ChangeSet)>>,
         snapshots: Mutex<BTreeMap<[u8; 32], Snapshot>>,
         change_sets: Mutex<BTreeMap<([u8; 32], [u8; 32]), ChangeSet>>,
+        head_seqno: Mutex<u64>,
     }
 
     impl MemoryCoordinator {
@@ -1097,6 +1125,7 @@ mod tests {
                 published: Mutex::new(Vec::new()),
                 snapshots: Mutex::new(BTreeMap::new()),
                 change_sets: Mutex::new(BTreeMap::new()),
+                head_seqno: Mutex::new(0),
             }
         }
 
@@ -1168,6 +1197,10 @@ mod tests {
 
         async fn fetch_frontier(&self, _repo_id: &String) -> Result<Frontier> {
             Ok(Frontier::default())
+        }
+
+        async fn fetch_head_seqno(&self, _repo_id: &String) -> Result<crate::core::SeqNo> {
+            Ok(*self.head_seqno.lock().unwrap())
         }
     }
 
@@ -2211,6 +2244,66 @@ mod tests {
         assert_eq!(
             engine.candidate_remote_tips().await.unwrap(),
             vec![("peer-b".into(), tip_snapshot.hash)]
+        );
+    }
+
+    #[test]
+    fn delta_window_uses_from_exclusive_to_inclusive_semantics() {
+        assert_eq!(SyncEngine::delta_window(7, 7), None);
+        assert_eq!(
+            SyncEngine::delta_window(7, 10),
+            Some(crate::core::DeltaWindow {
+                from_exclusive: 7,
+                to_inclusive: 10,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_window_to_head_uses_coordinator_head_seqno() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, file, tree) = sample_config_and_tree(sync_root.clone());
+        let snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            snapshot: snapshot.hash,
+            published_snapshot: snapshot.hash,
+            frontier: Frontier::default(),
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::File(file));
+        obj_store.insert(Object::Tree(tree.clone()));
+        obj_store.insert(Object::Snapshot(snapshot));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
+        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        *coordinator.head_seqno.lock().unwrap() = 12;
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            blob_worker,
+            applier,
+            coordinator,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            engine.delta_window_to_head(9).await.unwrap(),
+            Some(crate::core::DeltaWindow {
+                from_exclusive: 9,
+                to_inclusive: 12,
+            })
         );
     }
 

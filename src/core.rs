@@ -129,6 +129,13 @@ pub struct Checkpoint {
     pub seqno: SeqNo,
 }
 
+/// One ordered replay window in the coordinator-backed delta log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaWindow {
+    pub from_exclusive: SeqNo,
+    pub to_inclusive: SeqNo,
+}
+
 /// One ordered log entry in the coordinator-backed delta stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delta {

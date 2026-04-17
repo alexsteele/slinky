@@ -226,6 +226,20 @@ impl SyncEngine {
             CoordinatorNotification::Snapshot(announcement) => {
                 self.handle_remote_snapshot(announcement).await
             }
+            CoordinatorNotification::Delta(announcement) => {
+                self.log(&format!(
+                    "delta announcement scaffold: {} {}",
+                    announcement.device, announcement.seqno
+                ));
+                Ok(())
+            }
+            CoordinatorNotification::Checkpoint(announcement) => {
+                self.log(&format!(
+                    "checkpoint announcement scaffold: {} {}",
+                    announcement.device, announcement.checkpoint.seqno
+                ));
+                Ok(())
+            }
             CoordinatorNotification::PeerAvailable(peer) => {
                 self.log(&format!("peer available: {:?}", peer));
                 self.state

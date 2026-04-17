@@ -441,6 +441,20 @@ pub struct SnapshotAnnouncement {
     pub device: DeviceId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaAnnouncement {
+    pub repo_id: RepoId,
+    pub seqno: SeqNo,
+    pub device: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointAnnouncement {
+    pub repo_id: RepoId,
+    pub checkpoint: Checkpoint,
+    pub device: DeviceId,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

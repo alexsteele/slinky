@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256 as Sha256Hasher};
 pub type RepoId = String;
 pub type DeviceId = String;
 pub type Sha256 = [u8; 32];
+pub type SeqNo = u64;
+pub type DeltaHash = Sha256;
 pub type SnapshotHash = Sha256;
 pub type TreeHash = Sha256;
 pub type FileHash = Sha256;
@@ -118,6 +120,89 @@ impl Snapshot {
         self.hash = self.compute_hash();
         self.hash
     }
+}
+
+/// Binds a content-addressed snapshot to an ordered coordinator log position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub snapshot: SnapshotHash,
+    pub seqno: SeqNo,
+}
+
+/// One ordered log entry in the coordinator-backed delta stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Delta {
+    pub hash: DeltaHash,
+    pub seqno: SeqNo,
+    pub base_seqno: SeqNo,
+    pub device_id: DeviceId,
+    pub device_seqno: u64,
+    pub timestamp: SystemTime,
+    pub changes: Vec<Change>,
+}
+
+impl Delta {
+    /// Computes the canonical delta hash from ordering metadata and change payload.
+    pub fn compute_hash(&self) -> DeltaHash {
+        let mut hasher = Sha256Hasher::new();
+        hasher.update(self.seqno.to_le_bytes());
+        hasher.update(self.base_seqno.to_le_bytes());
+        hasher.update(self.device_id.as_bytes());
+        hasher.update(self.device_seqno.to_le_bytes());
+        for change in &self.changes {
+            change.hash_into(&mut hasher);
+        }
+        hasher.finalize().into()
+    }
+
+    /// Recomputes and stores the canonical delta hash.
+    pub fn update_hash(&mut self) -> DeltaHash {
+        self.hash = self.compute_hash();
+        self.hash
+    }
+}
+
+/// One logical filesystem change in a delta.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Change {
+    CreateDir { path: String },
+    DeletePath { path: String },
+    MovePath { from: String, to: String },
+    UpdateFile(FileChange),
+}
+
+impl Change {
+    fn hash_into(&self, hasher: &mut Sha256Hasher) {
+        match self {
+            Self::CreateDir { path } => {
+                hasher.update(b"create_dir");
+                hasher.update(path.as_bytes());
+            }
+            Self::DeletePath { path } => {
+                hasher.update(b"delete_path");
+                hasher.update(path.as_bytes());
+            }
+            Self::MovePath { from, to } => {
+                hasher.update(b"move_path");
+                hasher.update(from.as_bytes());
+                hasher.update(to.as_bytes());
+            }
+            Self::UpdateFile(change) => {
+                hasher.update(b"update_file");
+                hasher.update(change.path.as_bytes());
+                hasher.update(change.base_file.unwrap_or([0; 32]));
+                hasher.update(change.file.hash);
+            }
+        }
+    }
+}
+
+/// Describes one file version transition inside a delta.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub base_file: Option<FileHash>,
+    pub file: File,
 }
 
 /// A journal entry describing how to move from one snapshot to another.
@@ -359,8 +444,9 @@ pub struct SnapshotAnnouncement {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::UNIX_EPOCH;
 
-    use super::{File, Tree, TreeChange};
+    use super::{Change, Delta, File, FileChange, Tree, TreeChange};
 
     fn file(path: &str, tag: u8) -> File {
         let mut file = File {
@@ -428,5 +514,34 @@ mod tests {
             Some(TreeChange::File(file)) => assert_eq!(file.path, "docs/new.md"),
             other => panic!("expected new.md file entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn delta_hash_changes_when_payload_changes() {
+        let mut first = Delta {
+            hash: [0; 32],
+            seqno: 7,
+            base_seqno: 6,
+            device_id: "device-a".into(),
+            device_seqno: 3,
+            timestamp: UNIX_EPOCH,
+            changes: vec![Change::UpdateFile(FileChange {
+                path: "hello.txt".into(),
+                base_file: None,
+                file: file("hello.txt", 1),
+            })],
+        };
+        let first_hash = first.update_hash();
+
+        let mut second = first.clone();
+        second.changes = vec![Change::UpdateFile(FileChange {
+            path: "hello.txt".into(),
+            base_file: None,
+            file: file("hello.txt", 2),
+        })];
+        let second_hash = second.update_hash();
+
+        assert_ne!(first_hash, [0; 32]);
+        assert_ne!(first_hash, second_hash);
     }
 }

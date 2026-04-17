@@ -10,6 +10,19 @@ Intuitive conflict resolution. Never lose work.
 
 Totally self hosted. Easy setup. No third party managed service.
 
+## Model
+
+- Model the repo as a coordinator-sequenced log of deltas with periodic snapshots.
+- The coordinator assigns the canonical order of published deltas.
+- Deltas are the hot-path sync unit. They describe filesystem changes and do not require a
+  full merkle root on every change.
+- Snapshots are periodic checkpoints. They capture a full tree state at a specific log
+  position and support recovery, compaction, and catch-up.
+- Steady-state sync replays deltas after the local applied log position.
+- If a device is too far behind, sync falls back to snapshot plus remaining delta tail.
+- The coordinator orders concurrent changes, but devices detect semantic conflicts while
+  applying later deltas against the ordered state produced by earlier ones.
+
 ## Design
 
 - Coordinator-backed sync by default. Devices sync through a coordinator service that is
@@ -56,6 +69,9 @@ Totally self hosted. Easy setup. No third party managed service.
 
 ## Data Model
 
+- SeqNo
+  - coordinator-assigned log sequence number
+
 - Config
   - sync root
   - repo ID
@@ -63,6 +79,7 @@ Totally self hosted. Easy setup. No third party managed service.
   - public key
   - private key path
   - local snapshot
+  - applied seqno
   - remote frontier
   - pending transfers
   - transfer checkpoints
@@ -76,10 +93,29 @@ Totally self hosted. Easy setup. No third party managed service.
   - device ID
   - timestamp
 
-- ChangeSet
-  - base snapshot hash
-  - target snapshot hash
-  - diff
+- Checkpoint
+  - snapshot hash
+  - seqno
+
+- Delta
+  - hash
+  - seqno
+  - base seqno
+  - device ID
+  - device seqno
+  - timestamp
+  - changes
+
+- Change
+  - create dir
+  - delete path
+  - move path
+  - update file
+
+- FileChange
+  - path
+  - base file hash
+  - file
 
 - TreeDiff
   - entries
@@ -103,7 +139,7 @@ Totally self hosted. Easy setup. No third party managed service.
   - size
 
 - Object
-  - snapshot | tree | file | blob
+  - delta | snapshot | tree | file | blob
 
 ## Auth
 

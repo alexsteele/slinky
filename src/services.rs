@@ -168,6 +168,10 @@ pub enum ApplyOp {
         path: PathBuf,
         file: File,
     },
+    MovePath {
+        from: PathBuf,
+        to: PathBuf,
+    },
     CreateDir {
         path: PathBuf,
     },

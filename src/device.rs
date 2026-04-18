@@ -218,7 +218,7 @@ mod tests {
 
         let engine = device.service.engine.as_ref().unwrap();
         assert_ne!(engine.state.next_revision, 1);
-        assert!(!engine.pending_deltas.is_empty());
+        assert!(engine.pending_deltas.is_empty());
         assert!(
             engine
                 .tree
@@ -440,7 +440,7 @@ mod tests {
 
         let engine = device.service.engine.as_ref().unwrap();
         assert_ne!(engine.state.next_revision, 1);
-        assert!(engine.pending_deltas.len() >= 2);
+        assert!(engine.pending_deltas.is_empty());
 
         let docs_id = engine
             .index

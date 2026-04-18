@@ -367,9 +367,8 @@ impl SyncEngine {
         }
 
         if delta.seqno == self.state.accepted_seqno + 1 {
-            self.apply_remote_deltas(&delta.device_id, std::slice::from_ref(&delta))?;
-            self.state.accepted_seqno = delta.seqno;
-            self.save_state().await?;
+            self.apply_remote_deltas(&delta.device_id, std::slice::from_ref(&delta))
+                .await?;
             self.log(&format!(
                 "accepted contiguous remote delta {} from {}",
                 delta.seqno, delta.device_id
@@ -384,14 +383,12 @@ impl SyncEngine {
             .relay
             .fetch_delta_window(&self.config.repo_id, &window)
             .await?;
-        let fetched = self.apply_remote_deltas(&delta.device_id, &deltas)?;
+        let fetched = self.apply_remote_deltas(&delta.device_id, &deltas).await?;
         if fetched == 0 {
             self.log("remote delta fetch returned no applicable deltas");
             return Ok(());
         }
 
-        self.state.accepted_seqno = window.to_inclusive;
-        self.save_state().await?;
         self.log(&format!(
             "fetched {} remote deltas from {} up to seqno {}",
             fetched, delta.device_id, window.to_inclusive
@@ -399,8 +396,12 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Validates one remote delta batch before replay/apply is implemented.
-    fn apply_remote_deltas(&self, device_id: &DeviceId, deltas: &[Delta]) -> Result<usize> {
+    /// Validates and applies one remote delta batch for the simple hot path.
+    async fn apply_remote_deltas(
+        &mut self,
+        device_id: &DeviceId,
+        deltas: &[Delta],
+    ) -> Result<usize> {
         let mut expected = self.state.accepted_seqno + 1;
         for delta in deltas {
             if delta.device_id != *device_id {
@@ -416,6 +417,15 @@ impl SyncEngine {
             expected += 1;
         }
 
+        let plan = self.build_delta_apply_plan(deltas)?;
+        self.ensure_plan_blobs(&plan).await?;
+        self.applier.apply(&plan).await?;
+        self.refresh_local_tree_from_disk().await?;
+        if let Some(last) = deltas.last() {
+            self.state.accepted_seqno = last.seqno;
+            self.state.applied_seqno = last.seqno;
+            self.save_state().await?;
+        }
         Ok(deltas.len())
     }
 
@@ -701,16 +711,35 @@ impl SyncEngine {
 
     /// Flushes pending deltas toward the relay.
     ///
-    /// The current scaffold keeps the queue local until the relay delta publish path is wired up.
     async fn flush_pending_deltas(&mut self) -> Result<()> {
         if self.pending_deltas.is_empty() {
             return Ok(());
         }
 
-        self.log(&format!(
-            "pending delta flush scaffold: {} queued",
-            self.pending_deltas.len()
-        ));
+        while !self.pending_deltas.is_empty() {
+            let next_seqno = self.relay.fetch_head_seqno(&self.config.repo_id).await? + 1;
+            let pending = self.pending_deltas.remove(0);
+            let mut delta = Delta {
+                hash: [0; 32],
+                seqno: next_seqno,
+                base_seqno: pending.base_seqno,
+                device_id: pending.device_id.clone(),
+                revision: pending.revision,
+                timestamp: pending.timestamp,
+                changes: pending.changes,
+            };
+            delta.update_hash();
+
+            // TODO: A real relay should assign and acknowledge seqnos instead of trusting the
+            // device to propose one from the current head.
+            self.relay.publish_delta(&delta).await?;
+            self.state.accepted_seqno = delta.seqno;
+            self.state.applied_seqno = delta.seqno;
+            self.log(&format!(
+                "published local delta revision {} at seqno {}",
+                delta.revision, delta.seqno
+            ));
+        }
         Ok(())
     }
 
@@ -777,6 +806,18 @@ impl SyncEngine {
         Ok(index)
     }
 
+    async fn refresh_local_tree_from_disk(&mut self) -> Result<()> {
+        let tree = self.tree_builder.build_tree(&self.config.sync_root).await?;
+        let index = self.build_index_from_disk().await?;
+        let update = index.materialize_all()?;
+        for object in update.objects() {
+            self.obj_store.save_object(&object).await?;
+        }
+        self.tree = tree;
+        self.index = index;
+        Ok(())
+    }
+
     fn relative_path(&self, path: &Path) -> Option<PathBuf> {
         if let Ok(relative) = path.strip_prefix(&self.config.sync_root) {
             return Some(relative.to_path_buf());
@@ -801,6 +842,38 @@ impl SyncEngine {
             .strip_prefix(canonical_root)
             .ok()
             .map(Path::to_path_buf)
+    }
+
+    fn build_delta_apply_plan(&self, deltas: &[Delta]) -> Result<ApplyPlan> {
+        let mut ops = Vec::new();
+        let mut target_snapshot = self.state.snapshot;
+
+        for delta in deltas {
+            target_snapshot = [delta.seqno as u8; 32];
+            for change in &delta.changes {
+                match change {
+                    FileOp::CreateDir { path } => ops.push(ApplyOp::CreateDir {
+                        path: PathBuf::from(path),
+                    }),
+                    FileOp::Remove { path } => ops.push(ApplyOp::RemovePath {
+                        path: PathBuf::from(path),
+                    }),
+                    FileOp::Move { from, to } => ops.push(ApplyOp::MovePath {
+                        from: PathBuf::from(from),
+                        to: PathBuf::from(to),
+                    }),
+                    FileOp::Modify(change) => ops.push(ApplyOp::WriteFile {
+                        path: PathBuf::from(&change.path),
+                        file: change.file.clone(),
+                    }),
+                }
+            }
+        }
+
+        Ok(ApplyPlan {
+            target_snapshot,
+            ops,
+        })
     }
 
     /// Ensures blob content for file writes in a plan is available locally.
@@ -1070,12 +1143,12 @@ mod tests {
 
     use super::SyncEngine;
     use crate::core::{
-        ChangeSet, Config, Delta, DeviceCredentials, DeviceState, File, FileKind, Frontier,
-        FullBlob, Object, ObjectHash, ObjectId, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
-        TreeChange, TreeDiff, TreeEntry,
+        ChangeSet, Config, Delta, DeviceCredentials, DeviceState, File, FileChange, FileKind,
+        Frontier, FullBlob, Object, ObjectHash, ObjectId, Snapshot, SnapshotAnnouncement,
+        SnapshotHash, Tree, TreeChange, TreeDiff, TreeEntry,
     };
     use crate::local::util::hash_bytes;
-    use crate::local::{LocalApplier, LocalChunker, build_snapshot};
+    use crate::local::{LocalApplier, LocalChunker, LocalTreeBuilder, build_snapshot};
     use crate::relay::{Relay, RelayEvent, RelayEventStream};
     use crate::services::{
         Applier, ApplyOp, ApplyPlan, BlobStore, BlobTransferWorker, MetaStore, ObjStore, Result,
@@ -1300,6 +1373,7 @@ mod tests {
         snapshots: Mutex<BTreeMap<[u8; 32], Snapshot>>,
         change_sets: Mutex<BTreeMap<([u8; 32], [u8; 32]), ChangeSet>>,
         deltas: Mutex<BTreeMap<u64, Delta>>,
+        subscribers: Mutex<Vec<tokio::sync::mpsc::Sender<RelayEvent>>>,
         head_seqno: Mutex<u64>,
     }
 
@@ -1311,6 +1385,7 @@ mod tests {
                 snapshots: Mutex::new(BTreeMap::new()),
                 change_sets: Mutex::new(BTreeMap::new()),
                 deltas: Mutex::new(BTreeMap::new()),
+                subscribers: Mutex::new(Vec::new()),
                 head_seqno: Mutex::new(0),
             }
         }
@@ -1346,7 +1421,8 @@ mod tests {
             _repo_id: &String,
             _device_id: &String,
         ) -> Result<RelayEventStream> {
-            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            self.subscribers.lock().unwrap().push(tx);
             Ok(rx)
         }
 
@@ -1359,6 +1435,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((snapshot.clone(), change_set.clone()));
+            Ok(())
+        }
+
+        async fn publish_delta(&self, delta: &Delta) -> Result<()> {
+            self.insert_delta(delta.clone());
+            *self.head_seqno.lock().unwrap() = delta.seqno;
+            let subscribers = self.subscribers.lock().unwrap().clone();
+            for subscriber in subscribers {
+                let _ = subscriber.send(RelayEvent::Delta(delta.clone())).await;
+            }
             Ok(())
         }
 
@@ -1595,11 +1681,8 @@ mod tests {
         assert_eq!(after, before);
         assert_eq!(engine.state.snapshot, before);
         assert_ne!(engine.tree.hash, tree.hash);
-        assert_eq!(engine.pending_deltas.len(), 1);
-        assert!(matches!(
-            &engine.pending_deltas[0].changes[..],
-            [crate::core::FileOp::Modify(_)]
-        ));
+        assert!(engine.pending_deltas.is_empty());
+        assert_eq!(engine.state.accepted_seqno, 1);
         assert!(matches!(
             obj_store
                 .load_object(&ObjectId::Tree(engine.tree.hash))
@@ -1659,13 +1742,8 @@ mod tests {
         assert_eq!(tree_builder.calls(), 1);
         assert_eq!(after, before);
         assert!(engine.tree.entries.is_empty());
-        assert_eq!(engine.pending_deltas.len(), 1);
-        assert_eq!(
-            engine.pending_deltas[0].changes,
-            vec![crate::core::FileOp::Remove {
-                path: "docs".into(),
-            }]
-        );
+        assert!(engine.pending_deltas.is_empty());
+        assert_eq!(engine.state.accepted_seqno, 1);
     }
 
     #[tokio::test]
@@ -1732,13 +1810,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(engine.pending_deltas.len(), 1);
-        assert_eq!(
-            engine.pending_deltas[0].changes,
-            vec![crate::core::FileOp::Remove {
-                path: "docs/guide.md".into(),
-            }]
-        );
+        assert!(engine.pending_deltas.is_empty());
+        assert_eq!(engine.state.accepted_seqno, 1);
     }
 
     #[tokio::test]
@@ -1798,14 +1871,57 @@ mod tests {
         assert_eq!(tree_builder.calls(), 1);
         assert_eq!(after, before);
         assert_eq!(blob_store.len(), 1);
-        assert_eq!(engine.pending_deltas.len(), 1);
-        assert_eq!(
-            engine.pending_deltas[0].changes,
-            vec![crate::core::FileOp::Move {
-                from: "docs/guide.md".into(),
-                to: "guides/guide.md".into(),
-            }]
-        );
+        assert!(engine.pending_deltas.is_empty());
+        assert_eq!(engine.state.accepted_seqno, 1);
+    }
+
+    #[tokio::test]
+    async fn local_change_publishes_delta_to_relay() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+        let file_path = sync_root.join("hello.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let (config, file, tree) = sample_config_and_tree(sync_root.clone());
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::File(file.clone()));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
+        let relay = std::sync::Arc::new(MemoryRelay::new());
+        let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(tree.clone()));
+        let chunker = LocalChunker::open();
+
+        let mut engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            blob_worker,
+            applier,
+            relay.clone(),
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        engine.start().await.unwrap();
+        std::fs::write(&file_path, b"hello updated").unwrap();
+        engine
+            .handle_event(super::SyncEvent::Local(WatcherEvent::FileChanged(
+                file_path.clone(),
+            )))
+            .await
+            .unwrap();
+
+        assert!(engine.pending_deltas.is_empty());
+        assert_eq!(engine.state.accepted_seqno, 1);
+        assert_eq!(engine.state.applied_seqno, 1);
+        assert!(relay.deltas.lock().unwrap().contains_key(&1));
     }
 
     #[tokio::test]
@@ -2270,6 +2386,82 @@ mod tests {
             .unwrap();
 
         assert_eq!(engine.state.accepted_seqno, 6);
+    }
+
+    #[tokio::test]
+    async fn remote_delta_notification_applies_file_change_to_disk() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, _tree) = sample_config_and_tree(sync_root.clone());
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let docs_blob = hash_bytes(b"remote docs");
+        let mut docs_file = File {
+            path: "docs/readme.txt".into(),
+            hash: [0; 32],
+            blobs: vec![docs_blob],
+        };
+        docs_file.update_hash();
+        let blob_worker = std::sync::Arc::new(SeededBlobTransferWorker {
+            blob_store: blob_store.clone(),
+            blobs: BTreeMap::from([(docs_blob, b"remote docs".to_vec())]),
+        });
+        let applier = std::sync::Arc::new(LocalApplier::new(sync_root.clone(), blob_store.clone()));
+        let relay = std::sync::Arc::new(MemoryRelay::new());
+        let chunker = LocalChunker::open();
+        let tree_builder = std::sync::Arc::new(LocalTreeBuilder::new(chunker.clone()));
+
+        let mut engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            blob_worker,
+            applier,
+            relay,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        let mut delta = Delta {
+            hash: [0; 32],
+            seqno: 1,
+            base_seqno: 0,
+            device_id: "peer-1".into(),
+            revision: 1,
+            timestamp: SystemTime::now(),
+            changes: vec![crate::core::FileOp::Modify(FileChange {
+                path: "docs/readme.txt".into(),
+                base_file: None,
+                file: docs_file.clone(),
+            })],
+        };
+        delta.update_hash();
+
+        engine
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(delta)))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.state.accepted_seqno, 1);
+        assert_eq!(engine.state.applied_seqno, 1);
+        assert_eq!(
+            std::fs::read_to_string(sync_root.join("docs/readme.txt")).unwrap(),
+            "remote docs"
+        );
+        assert!(
+            engine
+                .index
+                .resolve_path(Path::new("docs/readme.txt"))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

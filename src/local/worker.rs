@@ -68,6 +68,28 @@ impl LocalApplier {
         }
         Ok(())
     }
+
+    fn move_path(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+        let from_path = self.full_path(from);
+        if !from_path.exists() {
+            return Ok(());
+        }
+
+        let to_path = self.full_path(to);
+        if let Some(parent) = to_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if to_path.exists() {
+            let metadata = std::fs::symlink_metadata(&to_path)?;
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(&to_path)?;
+            } else {
+                std::fs::remove_file(&to_path)?;
+            }
+        }
+        std::fs::rename(from_path, to_path)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -76,6 +98,7 @@ impl Applier for LocalApplier {
         for op in &plan.ops {
             match op {
                 ApplyOp::RemovePath { path } => self.remove_path(path)?,
+                ApplyOp::MovePath { from, to } => self.move_path(from, to)?,
                 ApplyOp::CreateDir { path } => {
                     std::fs::create_dir_all(self.full_path(path))?;
                 }
@@ -183,6 +206,10 @@ mod tests {
                 ops: vec![
                     ApplyOp::CreateDir {
                         path: PathBuf::from("docs"),
+                    },
+                    ApplyOp::MovePath {
+                        from: PathBuf::from("docs/missing.txt"),
+                        to: PathBuf::from("docs/ignored.txt"),
                     },
                     ApplyOp::WriteFile {
                         path: PathBuf::from("docs/hello.txt"),

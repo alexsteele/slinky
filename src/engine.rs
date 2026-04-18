@@ -624,13 +624,16 @@ impl SyncEngine {
         }
 
         let revision = self.state.next_revision;
-        self.pending_deltas.push(PendingDelta {
+        let delta = PendingDelta {
             device_id: self.config.device_id.clone(),
             revision,
             base_seqno: self.state.accepted_seqno,
             timestamp: SystemTime::now(),
             changes,
-        });
+        };
+        // TODO: Crash recovery currently relies on startup re-diff from the last published
+        // snapshot. Unpublished in-memory deltas are intentionally dropped on restart.
+        self.pending_deltas.push(delta);
         self.state.next_revision += 1;
         Ok(revision)
     }

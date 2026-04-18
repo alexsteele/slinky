@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::core::{Config, DeviceState, Frontier, Revision, SeqNo, SnapshotHash};
+use crate::core::{Config, DeviceState, Frontier, SeqNo, SnapshotHash};
 use crate::local::util::{decode_hash, device_root, encode_hash};
 use crate::services::{MetaStore, Result, SyncError};
 
@@ -31,16 +31,6 @@ impl LocalMetaStore {
                 accepted_seqno integer not null default 0,
                 next_revision integer not null default 1,
                 primary key (repo_id, device_id)
-            );
-
-            create table if not exists pending_deltas (
-                repo_id text not null,
-                device_id text not null,
-                revision integer not null,
-                base_seqno integer not null,
-                timestamp_sec integer not null,
-                data text not null,
-                primary key (repo_id, device_id, revision)
             );
 
             create table if not exists relay_state (
@@ -140,7 +130,7 @@ impl MetaStore for LocalMetaStore {
                 local_snapshot,
                 applied_seqno,
                 accepted_seqno,
-                next_revision,
+                _next_revision,
             )) => {
                 let snapshot = decode_hash(&snapshot)?;
                 let published_snapshot = if published_snapshot.is_empty() {
@@ -155,7 +145,7 @@ impl MetaStore for LocalMetaStore {
                     local_snapshot.or(Some(snapshot)),
                     applied_seqno as SeqNo,
                     accepted_seqno as SeqNo,
-                    next_revision as Revision,
+                    1,
                 )
             }
             None => ([0; 32], [0; 32], None, 0, 0, 1),
@@ -280,7 +270,6 @@ mod tests {
         let conn = Connection::open(device_root(&config).unwrap().join("meta.db")).unwrap();
         let tables = load_table_names(&conn);
         assert!(tables.contains("device_state"));
-        assert!(tables.contains("pending_deltas"));
         assert!(tables.contains("relay_state"));
         assert!(tables.contains("checkpoints"));
 

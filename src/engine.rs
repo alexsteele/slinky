@@ -418,9 +418,18 @@ impl SyncEngine {
         }
 
         let plan = self.build_delta_apply_plan(deltas)?;
+        let (next_index, updates) = self.stage_remote_deltas(deltas)?;
         self.ensure_plan_blobs(&plan).await?;
         self.applier.apply(&plan).await?;
-        self.refresh_local_tree_from_disk().await?;
+        for update in &updates {
+            for object in update.objects() {
+                self.obj_store.save_object(&object).await?;
+            }
+        }
+        if let Some(last_update) = updates.last() {
+            self.tree = last_update.root.clone();
+        }
+        self.index = next_index;
         if let Some(last) = deltas.last() {
             self.state.accepted_seqno = last.seqno;
             self.state.applied_seqno = last.seqno;
@@ -806,16 +815,28 @@ impl SyncEngine {
         Ok(index)
     }
 
-    async fn refresh_local_tree_from_disk(&mut self) -> Result<()> {
-        let tree = self.tree_builder.build_tree(&self.config.sync_root).await?;
-        let index = self.build_index_from_disk().await?;
-        let update = index.materialize_all()?;
-        for object in update.objects() {
-            self.obj_store.save_object(&object).await?;
+    /// Projects one remote delta batch onto the in-memory index without touching disk.
+    fn stage_remote_deltas(&self, deltas: &[Delta]) -> Result<(TreeIndex, Vec<TreeUpdate>)> {
+        let mut index = self.index.clone();
+        let mut updates = Vec::new();
+
+        for delta in deltas {
+            for change in &delta.changes {
+                let update = match change {
+                    FileOp::CreateDir { path } => index.ensure_directory(Path::new(path))?,
+                    FileOp::Remove { path } => index.remove_path(Path::new(path))?,
+                    FileOp::Move { from, to } => {
+                        index.move_path(Path::new(from), Path::new(to))?
+                    }
+                    FileOp::Modify(change) => {
+                        index.upsert_file(Path::new(&change.path), change.file.clone())?
+                    }
+                };
+                updates.push(update);
+            }
         }
-        self.tree = tree;
-        self.index = index;
-        Ok(())
+
+        Ok((index, updates))
     }
 
     fn relative_path(&self, path: &Path) -> Option<PathBuf> {
@@ -2428,6 +2449,7 @@ mod tests {
         )
         .await
         .unwrap();
+        engine.start().await.unwrap();
 
         let mut delta = Delta {
             hash: [0; 32],
@@ -2494,6 +2516,7 @@ mod tests {
         )
         .await
         .unwrap();
+        engine.start().await.unwrap();
 
         let mut delta = Delta {
             hash: [0; 32],
@@ -2515,6 +2538,13 @@ mod tests {
 
         assert_eq!(engine.state.accepted_seqno, 1);
         assert!(sync_root.join("docs/guides").is_dir());
+        assert!(
+            engine
+                .index
+                .resolve_path(Path::new("docs/guides"))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2548,6 +2578,7 @@ mod tests {
         )
         .await
         .unwrap();
+        engine.start().await.unwrap();
 
         let mut delta = Delta {
             hash: [0; 32],
@@ -2609,6 +2640,7 @@ mod tests {
         )
         .await
         .unwrap();
+        engine.start().await.unwrap();
 
         let mut delta = Delta {
             hash: [0; 32],

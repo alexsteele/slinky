@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use slinky::cli::{Cli, Command, CoordinatorCommand};
+use slinky::cli::{Cli, Command, RelayCommand};
 use slinky::core::{Config, DeviceCredentials};
 use slinky::device::Device;
 
@@ -31,8 +31,8 @@ async fn run(cli: Cli) -> Result<(), slinky::services::SyncError> {
             println!("sync root: {}", config.sync_root.display());
             println!("repo id: {}", config.repo_id);
             println!("device id: {}", config.device_id);
-            if let Some(coordinator) = args.coordinator {
-                println!("coordinator placeholder noted but not wired yet: {coordinator}");
+            if let Some(relay) = args.relay {
+                println!("relay placeholder noted but not wired yet: {relay}");
             }
         }
         Command::AddDevice(args) => {
@@ -62,10 +62,10 @@ async fn run(cli: Cli) -> Result<(), slinky::services::SyncError> {
         Command::Status => {
             println!("status scaffold");
         }
-        Command::Coordinator {
-            command: CoordinatorCommand::Serve(args),
+        Command::Relay {
+            command: RelayCommand::Serve(args),
         } => {
-            println!("coordinator serve scaffold: {:?}", args);
+            println!("relay serve scaffold: {:?}", args);
         }
     }
     Ok(())

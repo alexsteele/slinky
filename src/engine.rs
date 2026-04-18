@@ -1,7 +1,7 @@
 //! Serialized sync engine state.
 //!
 //! For now, the engine owns the simple bootstrap path: build the current tree from the local
-//! sync root and publish it to the coordinator. Runtime-driven local change handling can layer on
+//! sync root and publish it to the relay. Runtime-driven local change handling can layer on
 //! top later without changing the core startup flow.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,8 +16,8 @@ use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
 use crate::local::util::{encode_hash, walk_files};
 use crate::services::{
-    Applier, ApplyOp, ApplyPlan, BlobStore, BlobTransferWorker, Chunker, Coordinator,
-    CoordinatorNotification, MetaStore, ObjStore, Result, TreeBuilder, WatcherEvent,
+    Applier, ApplyOp, ApplyPlan, BlobStore, BlobTransferWorker, Chunker, MetaStore, ObjStore,
+    Relay, RelayNotification, Result, TreeBuilder, WatcherEvent,
 };
 
 /// Serialized device-side sync state machine.
@@ -35,7 +35,7 @@ pub struct SyncEngine {
     pub blob_store: Arc<dyn BlobStore>,
     pub blob_worker: Arc<dyn BlobTransferWorker>,
     pub applier: Arc<dyn Applier>,
-    pub coordinator: Arc<dyn Coordinator>,
+    pub relay: Arc<dyn Relay>,
     pub tree_builder: Arc<dyn TreeBuilder>,
     pub chunker: Arc<dyn Chunker>,
 }
@@ -70,7 +70,7 @@ struct FileBuild {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
     Local(WatcherEvent),
-    Remote(CoordinatorNotification),
+    Remote(RelayNotification),
 }
 
 impl SyncEngine {
@@ -89,15 +89,12 @@ impl SyncEngine {
         })
     }
 
-    /// Fetches the coordinator head and derives the replay window after one applied seqno.
+    /// Fetches the relay head and derives the replay window after one applied seqno.
     pub async fn delta_window_to_head(
         &self,
         applied_seqno: crate::core::SeqNo,
     ) -> Result<Option<DeltaWindow>> {
-        let head_seqno = self
-            .coordinator
-            .fetch_head_seqno(&self.config.repo_id)
-            .await?;
+        let head_seqno = self.relay.fetch_head_seqno(&self.config.repo_id).await?;
         Ok(Self::delta_window(applied_seqno, head_seqno))
     }
 
@@ -167,7 +164,7 @@ impl SyncEngine {
         blob_store: Arc<dyn BlobStore>,
         blob_worker: Arc<dyn BlobTransferWorker>,
         applier: Arc<dyn Applier>,
-        coordinator: Arc<dyn Coordinator>,
+        relay: Arc<dyn Relay>,
         tree_builder: Arc<dyn TreeBuilder>,
         chunker: Arc<dyn Chunker>,
     ) -> Result<Self> {
@@ -190,7 +187,7 @@ impl SyncEngine {
             blob_store,
             blob_worker,
             applier,
-            coordinator,
+            relay,
             tree_builder,
             chunker,
         })
@@ -198,8 +195,8 @@ impl SyncEngine {
 
     /// Builds the current local tree and publishes a new snapshot if it changed.
     pub async fn start(&mut self) -> Result<SnapshotHash> {
-        self.log("registering device with coordinator");
-        self.coordinator.register_device(&self.config).await?;
+        self.log("registering device with relay");
+        self.relay.register_device(&self.config).await?;
         self.full_sync("startup").await
     }
 
@@ -245,29 +242,26 @@ impl SyncEngine {
         }
     }
 
-    async fn handle_remote_notification(
-        &mut self,
-        notification: CoordinatorNotification,
-    ) -> Result<()> {
+    async fn handle_remote_notification(&mut self, notification: RelayNotification) -> Result<()> {
         match notification {
-            CoordinatorNotification::Snapshot(announcement) => {
+            RelayNotification::Snapshot(announcement) => {
                 self.handle_remote_snapshot(announcement).await
             }
-            CoordinatorNotification::Delta(announcement) => {
+            RelayNotification::Delta(announcement) => {
                 self.log(&format!(
                     "delta announcement scaffold: {} {}",
                     announcement.device, announcement.seqno
                 ));
                 Ok(())
             }
-            CoordinatorNotification::Checkpoint(announcement) => {
+            RelayNotification::Checkpoint(announcement) => {
                 self.log(&format!(
                     "checkpoint announcement scaffold: {} {}",
                     announcement.device, announcement.checkpoint.seqno
                 ));
                 Ok(())
             }
-            CoordinatorNotification::PeerAvailable(peer) => {
+            RelayNotification::PeerAvailable(peer) => {
                 self.log(&format!("peer available: {:?}", peer));
                 self.state
                     .frontier
@@ -299,12 +293,12 @@ impl SyncEngine {
         ));
 
         let snapshot = self
-            .coordinator
+            .relay
             .fetch_snapshot(&self.config.repo_id, &announcement.snapshot)
             .await?;
         let base = snapshot.parents.first().copied().unwrap_or([0; 32]);
         let change_set = self
-            .coordinator
+            .relay
             .fetch_change_set(&self.config.repo_id, &base, &snapshot.hash)
             .await?;
         self.obj_store
@@ -381,13 +375,13 @@ impl SyncEngine {
         }
 
         let change_set = self
-            .coordinator
+            .relay
             .fetch_change_set(&self.config.repo_id, &base, &target)
             .await?;
 
         if change_set.base != base || change_set.target != target {
             return Err(crate::services::SyncError::InvalidState(
-                "coordinator returned mismatched change set".into(),
+                "relay returned mismatched change set".into(),
             ));
         }
 
@@ -483,10 +477,8 @@ impl SyncEngine {
             .await?;
 
         // Publish the new snapshot, then advance the local published state.
-        self.log("publishing snapshot to coordinator");
-        self.coordinator
-            .publish_snapshot(&snapshot, &change_set)
-            .await?;
+        self.log("publishing snapshot to relay");
+        self.relay.publish_snapshot(&snapshot, &change_set).await?;
 
         let device_id = self.config.device_id.clone();
         self.tree = tree;
@@ -734,7 +726,7 @@ impl SyncEngine {
             Ok(snapshot) => Ok(snapshot),
             Err(crate::services::SyncError::NotFound) => {
                 let snapshot = self
-                    .coordinator
+                    .relay
                     .fetch_snapshot(&self.config.repo_id, &hash)
                     .await?;
                 self.obj_store
@@ -893,9 +885,8 @@ mod tests {
     use crate::local::util::hash_bytes;
     use crate::local::{LocalApplier, LocalChunker, build_snapshot};
     use crate::services::{
-        Applier, ApplyOp, ApplyPlan, BlobStore, BlobTransferWorker, Coordinator,
-        CoordinatorNotification, CoordinatorNotificationStream, MetaStore, ObjStore, Result,
-        SyncError, TreeBuilder, WatcherEvent,
+        Applier, ApplyOp, ApplyPlan, BlobStore, BlobTransferWorker, MetaStore, ObjStore, Relay,
+        RelayNotification, RelayNotificationStream, Result, SyncError, TreeBuilder, WatcherEvent,
     };
 
     struct MemoryMetaStore {
@@ -1110,7 +1101,7 @@ mod tests {
         std::sync::Arc::new(MemoryApplier)
     }
 
-    struct MemoryCoordinator {
+    struct MemoryRelay {
         register_calls: Mutex<usize>,
         published: Mutex<Vec<(Snapshot, ChangeSet)>>,
         snapshots: Mutex<BTreeMap<[u8; 32], Snapshot>>,
@@ -1118,7 +1109,7 @@ mod tests {
         head_seqno: Mutex<u64>,
     }
 
-    impl MemoryCoordinator {
+    impl MemoryRelay {
         fn new() -> Self {
             Self {
                 register_calls: Mutex::new(0),
@@ -1145,7 +1136,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Coordinator for MemoryCoordinator {
+    impl Relay for MemoryRelay {
         async fn register_device(&self, _config: &Config) -> Result<()> {
             *self.register_calls.lock().unwrap() += 1;
             Ok(())
@@ -1155,7 +1146,7 @@ mod tests {
             &self,
             _repo_id: &String,
             _device_id: &String,
-        ) -> Result<CoordinatorNotificationStream> {
+        ) -> Result<RelayNotificationStream> {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
             Ok(rx)
         }
@@ -1259,7 +1250,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree: tree.clone() });
         let chunker = LocalChunker::open();
 
@@ -1317,7 +1308,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree: tree.clone() });
         let chunker = LocalChunker::open();
 
@@ -1360,7 +1351,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(tree.clone()));
         let chunker = LocalChunker::open();
 
@@ -1422,7 +1413,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(root_tree.clone()));
         let chunker = LocalChunker::open();
 
@@ -1478,7 +1469,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(root_tree.clone()));
         let chunker = LocalChunker::open();
 
@@ -1547,7 +1538,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(CountingTreeBuilder::new(root_tree.clone()));
         let chunker = LocalChunker::open();
 
@@ -1605,7 +1596,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder {
             tree: Tree::empty(),
         });
@@ -1638,7 +1629,7 @@ mod tests {
         coordinator.insert_change_set(remote_change_set);
 
         engine
-            .handle_event(super::SyncEvent::Remote(CoordinatorNotification::Snapshot(
+            .handle_event(super::SyncEvent::Remote(RelayNotification::Snapshot(
                 SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: remote_snapshot.hash,
@@ -1685,7 +1676,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         coordinator.insert_snapshot(tip_snapshot.clone());
         coordinator.insert_change_set(ChangeSet {
             base: base_snapshot.hash,
@@ -1712,7 +1703,7 @@ mod tests {
         .unwrap();
 
         engine
-            .handle_event(super::SyncEvent::Remote(CoordinatorNotification::Snapshot(
+            .handle_event(super::SyncEvent::Remote(RelayNotification::Snapshot(
                 SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: tip_snapshot.hash,
@@ -1766,7 +1757,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         coordinator.insert_change_set(ChangeSet {
             base: base_snapshot.hash,
             target: target_snapshot.hash,
@@ -1838,7 +1829,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();
 
@@ -1922,7 +1913,7 @@ mod tests {
             blobs: BTreeMap::from([(docs_blob, b"remote docs".to_vec())]),
         });
         let applier = std::sync::Arc::new(LocalApplier::new(sync_root.clone(), blob_store.clone()));
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         coordinator.insert_snapshot(target_snapshot.clone());
         coordinator.insert_change_set(ChangeSet {
             base: base_snapshot.hash,
@@ -1949,7 +1940,7 @@ mod tests {
         .unwrap();
 
         engine
-            .handle_event(super::SyncEvent::Remote(CoordinatorNotification::Snapshot(
+            .handle_event(super::SyncEvent::Remote(RelayNotification::Snapshot(
                 SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: target_snapshot.hash,
@@ -1983,7 +1974,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();
 
@@ -2005,7 +1996,7 @@ mod tests {
         coordinator.insert_snapshot(remote_snapshot.clone());
 
         engine
-            .handle_event(super::SyncEvent::Remote(CoordinatorNotification::Snapshot(
+            .handle_event(super::SyncEvent::Remote(RelayNotification::Snapshot(
                 SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: remote_snapshot.hash,
@@ -2039,7 +2030,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();
 
@@ -2075,7 +2066,7 @@ mod tests {
         coordinator.insert_change_set(remote_change_set);
 
         engine
-            .handle_event(super::SyncEvent::Remote(CoordinatorNotification::Snapshot(
+            .handle_event(super::SyncEvent::Remote(RelayNotification::Snapshot(
                 SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: remote_snapshot.hash,
@@ -2120,7 +2111,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();
 
@@ -2169,7 +2160,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();
 
@@ -2221,7 +2212,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder {
             tree: Tree::empty(),
         });
@@ -2260,7 +2251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delta_window_to_head_uses_coordinator_head_seqno() {
+    async fn delta_window_to_head_uses_relay_head_seqno() {
         let dir = tempdir().unwrap();
         let sync_root = dir.path().join("sync");
         std::fs::create_dir_all(&sync_root).unwrap();
@@ -2279,7 +2270,7 @@ mod tests {
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
         let applier = test_applier();
-        let coordinator = std::sync::Arc::new(MemoryCoordinator::new());
+        let coordinator = std::sync::Arc::new(MemoryRelay::new());
         *coordinator.head_seqno.lock().unwrap() = 12;
         let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
         let chunker = LocalChunker::open();

@@ -1,7 +1,7 @@
 //! Service boundaries for the sync engine.
 //!
 //! These traits define the seams between the serialized engine and the outside world: persistence,
-//! coordinator I/O, filesystem observation, tree construction, reconciliation, and apply.
+//! relay I/O, filesystem observation, tree construction, reconciliation, and apply.
 
 use std::path::{Path, PathBuf};
 
@@ -18,22 +18,22 @@ use crate::engine::{ApplyJob, BlobTransferJob, BlobTransferResult};
 pub type Result<T> = std::result::Result<T, SyncError>;
 
 #[async_trait]
-pub trait Coordinator: Send + Sync {
-    /// Ensures the coordinator knows about this device before sync begins.
-    /// Register a device with the coordinator for its repo.
+pub trait Relay: Send + Sync {
+    /// Ensures the relay knows about this device before sync begins.
+    /// Register a device with the relay for its repo.
     async fn register_device(&self, config: &Config) -> Result<()>;
 
-    /// Subscribe to pushed coordinator notifications for a device.
+    /// Subscribe to pushed relay notifications for a device.
     async fn subscribe(
         &self,
         repo_id: &RepoId,
         device_id: &DeviceId,
-    ) -> Result<CoordinatorNotificationStream>;
+    ) -> Result<RelayNotificationStream>;
 
-    /// Publish a new snapshot plus its journal diff to the coordinator.
+    /// Publish a new snapshot plus its journal diff to the relay.
     async fn publish_snapshot(&self, snapshot: &Snapshot, change_set: &ChangeSet) -> Result<()>;
 
-    /// Publish one ordered delta into the coordinator-backed log.
+    /// Publish one ordered delta into the relay-backed log.
     ///
     /// The hybrid model expects this to become the normal hot path once the engine is migrated.
     async fn publish_delta(&self, _delta: &Delta) -> Result<()> {
@@ -42,7 +42,7 @@ pub trait Coordinator: Send + Sync {
         ))
     }
 
-    /// Publish a checkpoint that binds a local snapshot to a coordinator seqno.
+    /// Publish a checkpoint that binds a local snapshot to a relay seqno.
     async fn publish_checkpoint(&self, _checkpoint: &Checkpoint) -> Result<()> {
         Err(SyncError::InvalidState(
             "publish_checkpoint not implemented".into(),
@@ -94,7 +94,7 @@ pub trait Coordinator: Send + Sync {
         Ok(None)
     }
 
-    /// Fetch the coordinator's current ordered log head for a repo.
+    /// Fetch the relay's current ordered log head for a repo.
     async fn fetch_head_seqno(&self, _repo_id: &RepoId) -> Result<SeqNo> {
         Ok(0)
     }
@@ -103,16 +103,16 @@ pub trait Coordinator: Send + Sync {
     async fn fetch_frontier(&self, repo_id: &RepoId) -> Result<Frontier>;
 }
 
-/// Push notification from the coordinator control plane.
+/// Push notification from the relay control plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CoordinatorNotification {
+pub enum RelayNotification {
     Snapshot(SnapshotAnnouncement),
     Delta(DeltaAnnouncement),
     Checkpoint(CheckpointAnnouncement),
     PeerAvailable(PeerState),
 }
 
-pub type CoordinatorNotificationStream = mpsc::Receiver<CoordinatorNotification>;
+pub type RelayNotificationStream = mpsc::Receiver<RelayNotification>;
 
 /// Shared sync error type used across local services and runtime workers.
 #[derive(Debug)]

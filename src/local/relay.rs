@@ -2,12 +2,12 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::core::{ChangeSet, Checkpoint, Config, Delta, Frontier, SeqNo, Snapshot, SnapshotHash};
-use crate::services::{Coordinator, CoordinatorNotificationStream, Result, SyncError};
+use crate::services::{Relay, RelayNotificationStream, Result, SyncError};
 
-pub struct NoopCoordinator;
+pub struct NoopRelay;
 
 #[async_trait]
-impl Coordinator for NoopCoordinator {
+impl Relay for NoopRelay {
     async fn register_device(&self, _config: &Config) -> Result<()> {
         Ok(())
     }
@@ -16,7 +16,7 @@ impl Coordinator for NoopCoordinator {
         &self,
         _repo_id: &String,
         _device_id: &String,
-    ) -> Result<CoordinatorNotificationStream> {
+    ) -> Result<RelayNotificationStream> {
         let (_tx, rx) = mpsc::channel(1);
         Ok(rx)
     }

@@ -1,7 +1,7 @@
 pub mod blob_store;
 pub mod chunker;
 pub mod config;
-pub mod coordinator;
+pub mod relay;
 pub mod meta_store;
 pub mod obj_store;
 pub mod reconciler;
@@ -15,7 +15,7 @@ pub mod worker;
 pub use blob_store::LocalBlobStore;
 pub use chunker::LocalChunker;
 pub use config::load_config;
-pub use coordinator::NoopCoordinator;
+pub use relay::NoopRelay;
 pub use meta_store::LocalMetaStore;
 pub use obj_store::LocalObjStore;
 pub use reconciler::NoopReconciler;

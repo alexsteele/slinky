@@ -4,11 +4,11 @@ use crate::core::Config;
 use crate::engine::SyncEngine;
 use crate::local::{
     FsWatcher, LocalApplier, LocalBlobStore, LocalBlobTransferWorker, LocalChunker, LocalMetaStore,
-    LocalObjStore, LocalTreeBuilder, NoopCoordinator, load_config,
+    LocalObjStore, LocalTreeBuilder, NoopRelay, load_config,
 };
 use crate::runtime::SyncService;
 use crate::services::{
-    Applier, BlobStore, BlobTransferWorker, Chunker, Coordinator, MetaStore, ObjStore, Result,
+    Applier, BlobStore, BlobTransferWorker, Chunker, MetaStore, ObjStore, Relay, Result,
     TreeBuilder, Watcher,
 };
 
@@ -16,7 +16,7 @@ use crate::services::{
 ///
 /// Responsibilities:
 /// - own the local device config
-/// - connect to the coordinator using that config
+/// - connect to the relay using that config
 /// - construct the serialized sync engine
 /// - expose the sync service lifecycle
 pub struct Device {
@@ -31,7 +31,7 @@ impl Device {
         let blob_worker = Self::open_blob_worker(blob_store.clone()).await?;
         let applier = Self::open_applier(&config, blob_store.clone()).await?;
         let obj_store = Self::open_obj_store(&config).await?;
-        let coordinator = Self::connect_coordinator(&config).await?;
+        let relay = Self::connect_relay(&config).await?;
         let chunker = Self::open_chunker().await?;
         let tree_builder = Self::open_tree_builder(chunker.clone()).await?;
         let watcher = Self::open_watcher().await?;
@@ -43,7 +43,7 @@ impl Device {
             blob_store,
             blob_worker,
             applier,
-            coordinator,
+            relay,
             tree_builder,
             chunker,
         )
@@ -87,8 +87,8 @@ impl Device {
         LocalBlobStore::open(_config)
     }
 
-    async fn connect_coordinator(_config: &Config) -> Result<Arc<dyn Coordinator>> {
-        Ok(Arc::new(NoopCoordinator))
+    async fn connect_relay(_config: &Config) -> Result<Arc<dyn Relay>> {
+        Ok(Arc::new(NoopRelay))
     }
 
     async fn open_blob_worker(

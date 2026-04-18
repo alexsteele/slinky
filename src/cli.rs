@@ -20,9 +20,9 @@ pub enum Command {
     Start(StartArgs),
     Stop,
     Status,
-    Coordinator {
+    Relay {
         #[command(subcommand)]
-        command: CoordinatorCommand,
+        command: RelayCommand,
     },
 }
 
@@ -32,13 +32,13 @@ pub struct SetupArgs {
     pub sync_root: Option<PathBuf>,
 
     #[arg(long)]
-    pub coordinator: Option<String>,
+    pub relay: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct AddDeviceArgs {
     #[arg(long)]
-    pub coordinator: Option<String>,
+    pub relay: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -48,12 +48,12 @@ pub struct StartArgs {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum CoordinatorCommand {
-    Serve(CoordinatorServeArgs),
+pub enum RelayCommand {
+    Serve(RelayServeArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct CoordinatorServeArgs {
+pub struct RelayServeArgs {
     #[arg(long)]
     pub bind: Option<String>,
 }

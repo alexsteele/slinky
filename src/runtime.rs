@@ -20,10 +20,10 @@ pub struct SyncService {
     started: bool,
     shutdown_tx: Option<oneshot::Sender<()>>,
     watcher_shutdown_tx: Option<oneshot::Sender<()>>,
-    coordinator_shutdown_tx: Option<oneshot::Sender<()>>,
+    relay_shutdown_tx: Option<oneshot::Sender<()>>,
     engine_task: Option<JoinHandle<Result<SyncEngine>>>,
     watcher_task: Option<JoinHandle<Result<()>>>,
-    coordinator_task: Option<JoinHandle<Result<()>>>,
+    relay_task: Option<JoinHandle<Result<()>>>,
 }
 
 impl SyncService {
@@ -35,10 +35,10 @@ impl SyncService {
             started: false,
             shutdown_tx: None,
             watcher_shutdown_tx: None,
-            coordinator_shutdown_tx: None,
+            relay_shutdown_tx: None,
             engine_task: None,
             watcher_task: None,
-            coordinator_task: None,
+            relay_task: None,
         }
     }
 
@@ -59,18 +59,18 @@ impl SyncService {
         let (event_tx, mut event_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
         let watcher = self.watcher.clone();
         let sync_root = self.sync_root.clone();
-        let coordinator = engine.coordinator.clone();
+        let relay = engine.relay.clone();
         let repo_id = engine.config.repo_id.clone();
         let device_id = engine.config.device_id.clone();
         let watcher_event_tx = event_tx.clone();
-        let coordinator_event_tx = event_tx.clone();
+        let relay_event_tx = event_tx.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let (watcher_shutdown_tx, watcher_shutdown_rx) = oneshot::channel();
-        let (coordinator_shutdown_tx, mut coordinator_shutdown_rx) = oneshot::channel();
+        let (relay_shutdown_tx, mut relay_shutdown_rx) = oneshot::channel();
         let (watcher_ready_tx, watcher_ready_rx) = oneshot::channel();
         self.shutdown_tx = Some(shutdown_tx);
         self.watcher_shutdown_tx = Some(watcher_shutdown_tx);
-        self.coordinator_shutdown_tx = Some(coordinator_shutdown_tx);
+        self.relay_shutdown_tx = Some(relay_shutdown_tx);
 
         self.watcher_task = Some(tokio::spawn(async move {
             eprintln!("[service] starting watcher task");
@@ -93,13 +93,13 @@ impl SyncService {
             Ok(())
         }));
 
-        self.coordinator_task = Some(tokio::spawn(async move {
-            eprintln!("[service] subscribing to coordinator notifications");
-            let mut stream = coordinator.subscribe(&repo_id, &device_id).await?;
+        self.relay_task = Some(tokio::spawn(async move {
+            eprintln!("[service] subscribing to relay notifications");
+            let mut stream = relay.subscribe(&repo_id, &device_id).await?;
             loop {
                 tokio::select! {
-                    _ = &mut coordinator_shutdown_rx => {
-                        eprintln!("[service] coordinator task shutting down");
+                    _ = &mut relay_shutdown_rx => {
+                        eprintln!("[service] relay task shutting down");
                         break;
                     }
                     notification = stream.recv() => {
@@ -107,10 +107,10 @@ impl SyncService {
                             break;
                         };
                         eprintln!(
-                            "[service] received coordinator notification: {:?}",
+                            "[service] received relay notification: {:?}",
                             notification
                         );
-                        if coordinator_event_tx
+                        if relay_event_tx
                             .send(SyncEvent::Remote(notification))
                             .await
                             .is_err()
@@ -161,8 +161,8 @@ impl SyncService {
         if let Some(watcher_shutdown_tx) = self.watcher_shutdown_tx.take() {
             let _ = watcher_shutdown_tx.send(());
         }
-        if let Some(coordinator_shutdown_tx) = self.coordinator_shutdown_tx.take() {
-            let _ = coordinator_shutdown_tx.send(());
+        if let Some(relay_shutdown_tx) = self.relay_shutdown_tx.take() {
+            let _ = relay_shutdown_tx.send(());
         }
         Ok(())
     }
@@ -179,12 +179,12 @@ impl SyncService {
             }
         }
 
-        if let Some(coordinator_task) = self.coordinator_task.take() {
-            match coordinator_task.await {
+        if let Some(relay_task) = self.relay_task.take() {
+            match relay_task.await {
                 Ok(result) => result?,
                 Err(join_error) => {
                     return Err(SyncError::InvalidState(format!(
-                        "coordinator task failed to join: {join_error}"
+                        "relay task failed to join: {join_error}"
                     )));
                 }
             }

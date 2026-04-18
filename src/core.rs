@@ -13,13 +13,16 @@ use sha2::{Digest, Sha256 as Sha256Hasher};
 
 pub type RepoId = String;
 pub type DeviceId = String;
-pub type Sha256 = [u8; 32];
+// Relay-assigned log sequence number.
 pub type SeqNo = u64;
-pub type DeltaHash = Sha256;
+// Locally assigned log sequence number.
+pub type Revision = u64;
+pub type Sha256 = [u8; 32];
 pub type SnapshotHash = Sha256;
 pub type TreeHash = Sha256;
 pub type FileHash = Sha256;
 pub type BlobHash = Sha256;
+pub type DeltaHash = Sha256;
 
 /// Local device configuration needed to join and run a repo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,10 +39,6 @@ pub struct DeviceState {
     pub snapshot: SnapshotHash,
     pub published_snapshot: SnapshotHash,
     pub frontier: Frontier,
-    // TODO: Do we need these?
-    // pub transfers: Vec<PendingTransfer>,
-    // pub conflicts: Vec<ConflictRecord>,
-    // pub tombstones: Vec<Tombstone>,
 }
 
 /// A peer's advertised tip snapshot within the repo frontier.
@@ -58,7 +57,7 @@ pub struct DeviceCredentials {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageBackend {
-    CoordinatorManaged,
+    RelayManaged,
     CloudObjectStore,
     PeerToPeer,
 }
@@ -122,30 +121,30 @@ impl Snapshot {
     }
 }
 
-/// Binds a content-addressed snapshot to an ordered coordinator log position.
+/// Binds a content-addressed snapshot to an ordered relay log position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub snapshot: SnapshotHash,
     pub seqno: SeqNo,
 }
 
-/// One ordered replay window in the coordinator-backed delta log.
+/// One ordered replay window in the relay-backed delta log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeltaWindow {
     pub from_exclusive: SeqNo,
     pub to_inclusive: SeqNo,
 }
 
-/// One ordered log entry in the coordinator-backed delta stream.
+/// One ordered log entry in the relay-backed delta stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delta {
     pub hash: DeltaHash,
     pub seqno: SeqNo,
     pub base_seqno: SeqNo,
     pub device_id: DeviceId,
-    pub device_seqno: u64,
+    pub revision: Revision,
     pub timestamp: SystemTime,
-    pub changes: Vec<Change>,
+    pub changes: Vec<FileOp>,
 }
 
 impl Delta {
@@ -155,7 +154,7 @@ impl Delta {
         hasher.update(self.seqno.to_le_bytes());
         hasher.update(self.base_seqno.to_le_bytes());
         hasher.update(self.device_id.as_bytes());
-        hasher.update(self.device_seqno.to_le_bytes());
+        hasher.update(self.revision.to_le_bytes());
         for change in &self.changes {
             change.hash_into(&mut hasher);
         }
@@ -169,32 +168,50 @@ impl Delta {
     }
 }
 
-/// One logical filesystem change in a delta.
+/// One local authored delta that has not yet been accepted into the ordered relay log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Change {
-    CreateDir { path: String },
-    DeletePath { path: String },
-    MovePath { from: String, to: String },
-    UpdateFile(FileChange),
+pub struct PendingDelta {
+    pub device_id: DeviceId,
+    pub revision: Revision,
+    pub base_seqno: SeqNo,
+    pub timestamp: SystemTime,
+    pub changes: Vec<FileOp>,
 }
 
-impl Change {
+/// Relay acknowledgement that binds one local revision to an accepted seqno.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaAck {
+    pub device_id: DeviceId,
+    pub revision: Revision,
+    pub seqno: SeqNo,
+}
+
+/// One logical filesystem change in a delta.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileOp {
+    CreateDir { path: String },
+    Remove { path: String },
+    Move { from: String, to: String },
+    Modify(FileChange),
+}
+
+impl FileOp {
     fn hash_into(&self, hasher: &mut Sha256Hasher) {
         match self {
             Self::CreateDir { path } => {
                 hasher.update(b"create_dir");
                 hasher.update(path.as_bytes());
             }
-            Self::DeletePath { path } => {
+            Self::Remove { path } => {
                 hasher.update(b"delete_path");
                 hasher.update(path.as_bytes());
             }
-            Self::MovePath { from, to } => {
+            Self::Move { from, to } => {
                 hasher.update(b"move_path");
                 hasher.update(from.as_bytes());
                 hasher.update(to.as_bytes());
             }
-            Self::UpdateFile(change) => {
+            Self::Modify(change) => {
                 hasher.update(b"update_file");
                 hasher.update(change.path.as_bytes());
                 hasher.update(change.base_file.unwrap_or([0; 32]));
@@ -467,7 +484,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::UNIX_EPOCH;
 
-    use super::{Change, Delta, File, FileChange, Tree, TreeChange};
+    use super::{Delta, File, FileChange, FileOp, PendingDelta, Tree, TreeChange};
 
     fn file(path: &str, tag: u8) -> File {
         let mut file = File {
@@ -544,9 +561,9 @@ mod tests {
             seqno: 7,
             base_seqno: 6,
             device_id: "device-a".into(),
-            device_seqno: 3,
+            revision: 3,
             timestamp: UNIX_EPOCH,
-            changes: vec![Change::UpdateFile(FileChange {
+            changes: vec![FileOp::Modify(FileChange {
                 path: "hello.txt".into(),
                 base_file: None,
                 file: file("hello.txt", 1),
@@ -555,7 +572,7 @@ mod tests {
         let first_hash = first.update_hash();
 
         let mut second = first.clone();
-        second.changes = vec![Change::UpdateFile(FileChange {
+        second.changes = vec![FileOp::Modify(FileChange {
             path: "hello.txt".into(),
             base_file: None,
             file: file("hello.txt", 2),
@@ -564,5 +581,22 @@ mod tests {
 
         assert_ne!(first_hash, [0; 32]);
         assert_ne!(first_hash, second_hash);
+    }
+
+    #[test]
+    fn pending_delta_keeps_local_revision_without_seqno() {
+        let pending = PendingDelta {
+            device_id: "device-a".into(),
+            revision: 11,
+            base_seqno: 7,
+            timestamp: UNIX_EPOCH,
+            changes: vec![FileOp::Remove {
+                path: "hello.txt".into(),
+            }],
+        };
+
+        assert_eq!(pending.revision, 11);
+        assert_eq!(pending.base_seqno, 7);
+        assert_eq!(pending.device_id, "device-a");
     }
 }

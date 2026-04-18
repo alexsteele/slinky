@@ -2465,6 +2465,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_delta_notification_applies_directory_create_to_disk() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, _tree) = sample_config_and_tree(sync_root.clone());
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = std::sync::Arc::new(LocalApplier::new(sync_root.clone(), blob_store.clone()));
+        let relay = std::sync::Arc::new(MemoryRelay::new());
+        let chunker = LocalChunker::open();
+        let tree_builder = std::sync::Arc::new(LocalTreeBuilder::new(chunker.clone()));
+
+        let mut engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            blob_worker,
+            applier,
+            relay,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        let mut delta = Delta {
+            hash: [0; 32],
+            seqno: 1,
+            base_seqno: 0,
+            device_id: "peer-1".into(),
+            revision: 1,
+            timestamp: SystemTime::now(),
+            changes: vec![crate::core::FileOp::CreateDir {
+                path: "docs/guides".into(),
+            }],
+        };
+        delta.update_hash();
+
+        engine
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(delta)))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.state.accepted_seqno, 1);
+        assert!(sync_root.join("docs/guides").is_dir());
+    }
+
+    #[tokio::test]
+    async fn remote_delta_notification_applies_path_remove_to_disk() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        std::fs::write(sync_root.join("docs/old.txt"), b"stale").unwrap();
+
+        let (config, _file, _tree) = sample_config_and_tree(sync_root.clone());
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = std::sync::Arc::new(LocalApplier::new(sync_root.clone(), blob_store.clone()));
+        let relay = std::sync::Arc::new(MemoryRelay::new());
+        let chunker = LocalChunker::open();
+        let tree_builder = std::sync::Arc::new(LocalTreeBuilder::new(chunker.clone()));
+
+        let mut engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            blob_worker,
+            applier,
+            relay,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        let mut delta = Delta {
+            hash: [0; 32],
+            seqno: 1,
+            base_seqno: 0,
+            device_id: "peer-1".into(),
+            revision: 1,
+            timestamp: SystemTime::now(),
+            changes: vec![crate::core::FileOp::Remove {
+                path: "docs/old.txt".into(),
+            }],
+        };
+        delta.update_hash();
+
+        engine
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(delta)))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.state.accepted_seqno, 1);
+        assert!(!sync_root.join("docs/old.txt").exists());
+        assert!(
+            engine
+                .index
+                .resolve_path(Path::new("docs/old.txt"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_delta_notification_applies_path_move_to_disk() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        std::fs::write(sync_root.join("docs/old.txt"), b"remote move").unwrap();
+
+        let (config, _file, _tree) = sample_config_and_tree(sync_root.clone());
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = std::sync::Arc::new(LocalApplier::new(sync_root.clone(), blob_store.clone()));
+        let relay = std::sync::Arc::new(MemoryRelay::new());
+        let chunker = LocalChunker::open();
+        let tree_builder = std::sync::Arc::new(LocalTreeBuilder::new(chunker.clone()));
+
+        let mut engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            blob_worker,
+            applier,
+            relay,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        let mut delta = Delta {
+            hash: [0; 32],
+            seqno: 1,
+            base_seqno: 0,
+            device_id: "peer-1".into(),
+            revision: 1,
+            timestamp: SystemTime::now(),
+            changes: vec![crate::core::FileOp::Move {
+                from: "docs/old.txt".into(),
+                to: "docs/new.txt".into(),
+            }],
+        };
+        delta.update_hash();
+
+        engine
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(delta)))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.state.accepted_seqno, 1);
+        assert!(!sync_root.join("docs/old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(sync_root.join("docs/new.txt")).unwrap(),
+            "remote move"
+        );
+        assert!(
+            engine
+                .index
+                .resolve_path(Path::new("docs/old.txt"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .index
+                .resolve_path(Path::new("docs/new.txt"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn remote_delta_notification_ignores_self_and_stale_seqnos() {
         let dir = tempdir().unwrap();
         let sync_root = dir.path().join("sync");

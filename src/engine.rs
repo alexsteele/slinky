@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::core::{
-    BlobHash, ChangeSet, Config, DeltaWindow, DeviceId, DeviceState, File, FileChange, FileOp,
-    Object, ObjectId, PendingDelta, Revision, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
-    TreeDiff,
+    BlobHash, ChangeSet, Config, Delta, DeltaAnnouncement, DeltaWindow, DeviceId, DeviceState,
+    File, FileChange, FileOp, Object, ObjectId, PendingDelta, Revision, Snapshot,
+    SnapshotAnnouncement, SnapshotHash, Tree, TreeDiff,
 };
 use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
@@ -250,13 +250,7 @@ impl SyncEngine {
     async fn handle_remote_notification(&mut self, notification: RelayEvent) -> Result<()> {
         match notification {
             RelayEvent::Snapshot(announcement) => self.handle_remote_snapshot(announcement).await,
-            RelayEvent::Delta(announcement) => {
-                self.log(&format!(
-                    "delta announcement scaffold: {} {}",
-                    announcement.device, announcement.seqno
-                ));
-                Ok(())
-            }
+            RelayEvent::Delta(announcement) => self.handle_remote_delta(announcement).await,
             RelayEvent::Checkpoint(announcement) => {
                 self.log(&format!(
                     "checkpoint announcement scaffold: {} {}",
@@ -356,6 +350,75 @@ impl SyncEngine {
             announcement.device
         ));
         Ok(())
+    }
+
+    async fn handle_remote_delta(&mut self, announcement: DeltaAnnouncement) -> Result<()> {
+        if announcement.repo_id != self.config.repo_id {
+            self.log(&format!(
+                "ignoring remote delta for different repo: {}",
+                announcement.repo_id
+            ));
+            return Ok(());
+        }
+
+        if announcement.device == self.config.device_id {
+            self.log("ignoring remote delta from local device");
+            return Ok(());
+        }
+
+        if announcement.seqno <= self.state.accepted_seqno {
+            self.log(&format!(
+                "ignoring stale remote delta {} from {}",
+                announcement.seqno, announcement.device
+            ));
+            return Ok(());
+        }
+
+        let Some(window) = Self::delta_window(self.state.accepted_seqno, announcement.seqno) else {
+            return Ok(());
+        };
+        let deltas = self
+            .relay
+            .fetch_delta_window(&self.config.repo_id, &window)
+            .await?;
+        let fetched = self.validate_remote_deltas(&announcement.device, &window, &deltas)?;
+        if fetched == 0 {
+            self.log("remote delta fetch returned no applicable deltas");
+            return Ok(());
+        }
+
+        self.state.accepted_seqno = window.to_inclusive;
+        self.save_state().await?;
+        self.log(&format!(
+            "fetched {} remote deltas from {} up to seqno {}",
+            fetched, announcement.device, window.to_inclusive
+        ));
+        Ok(())
+    }
+
+    /// Validates one fetched relay delta window before replay/apply is implemented.
+    fn validate_remote_deltas(
+        &self,
+        device_id: &DeviceId,
+        window: &DeltaWindow,
+        deltas: &[Delta],
+    ) -> Result<usize> {
+        let mut expected = window.from_exclusive + 1;
+        for delta in deltas {
+            if delta.device_id != *device_id {
+                return Err(crate::services::SyncError::InvalidState(
+                    "relay returned delta for the wrong device".into(),
+                ));
+            }
+            if delta.seqno != expected {
+                return Err(crate::services::SyncError::InvalidState(
+                    "relay returned a non-contiguous delta window".into(),
+                ));
+            }
+            expected += 1;
+        }
+
+        Ok(deltas.len())
     }
 
     /// Plans a fast-forward reconcile from the current local snapshot to a remote target.
@@ -1009,9 +1072,9 @@ mod tests {
 
     use super::SyncEngine;
     use crate::core::{
-        ChangeSet, Config, DeviceCredentials, DeviceState, File, FileKind, Frontier, FullBlob,
-        Object, ObjectHash, ObjectId, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
-        TreeChange, TreeDiff, TreeEntry,
+        ChangeSet, Config, Delta, DeltaAnnouncement, DeviceCredentials, DeviceState, File,
+        FileKind, Frontier, FullBlob, Object, ObjectHash, ObjectId, Snapshot,
+        SnapshotAnnouncement, SnapshotHash, Tree, TreeChange, TreeDiff, TreeEntry,
     };
     use crate::local::util::hash_bytes;
     use crate::local::{LocalApplier, LocalChunker, build_snapshot};
@@ -1238,6 +1301,7 @@ mod tests {
         published: Mutex<Vec<(Snapshot, ChangeSet)>>,
         snapshots: Mutex<BTreeMap<[u8; 32], Snapshot>>,
         change_sets: Mutex<BTreeMap<([u8; 32], [u8; 32]), ChangeSet>>,
+        deltas: Mutex<BTreeMap<u64, Delta>>,
         head_seqno: Mutex<u64>,
     }
 
@@ -1248,6 +1312,7 @@ mod tests {
                 published: Mutex::new(Vec::new()),
                 snapshots: Mutex::new(BTreeMap::new()),
                 change_sets: Mutex::new(BTreeMap::new()),
+                deltas: Mutex::new(BTreeMap::new()),
                 head_seqno: Mutex::new(0),
             }
         }
@@ -1264,6 +1329,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert((change_set.base, change_set.target), change_set);
+        }
+
+        fn insert_delta(&self, delta: Delta) {
+            self.deltas.lock().unwrap().insert(delta.seqno, delta);
         }
     }
 
@@ -1320,6 +1389,23 @@ mod tests {
 
         async fn fetch_frontier(&self, _repo_id: &String) -> Result<Frontier> {
             Ok(Frontier::default())
+        }
+
+        async fn fetch_deltas(
+            &self,
+            _repo_id: &String,
+            from_exclusive: crate::core::SeqNo,
+            to_inclusive: crate::core::SeqNo,
+        ) -> Result<Vec<Delta>> {
+            let deltas = self.deltas.lock().unwrap();
+            let mut fetched = Vec::new();
+            for seqno in (from_exclusive + 1)..=to_inclusive {
+                let Some(delta) = deltas.get(&seqno) else {
+                    break;
+                };
+                fetched.push(delta.clone());
+            }
+            Ok(fetched)
         }
 
         async fn fetch_head_seqno(&self, _repo_id: &String) -> Result<crate::core::SeqNo> {
@@ -2144,6 +2230,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_delta_notification_fetches_missing_window_and_advances_seqno() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            accepted_seqno: 4,
+            ..test_device_state([0; 32], [0; 32])
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
+        let relay = std::sync::Arc::new(MemoryRelay::new());
+        relay.insert_delta(sample_delta("peer-1", 5));
+        relay.insert_delta(sample_delta("peer-1", 6));
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let mut engine = SyncEngine::open(
+            config.clone(),
+            meta_store,
+            obj_store,
+            blob_store,
+            blob_worker,
+            applier,
+            relay,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        engine
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(
+                DeltaAnnouncement {
+                    repo_id: config.repo_id.clone(),
+                    device: "peer-1".into(),
+                    seqno: 6,
+                },
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.state.accepted_seqno, 6);
+    }
+
+    #[tokio::test]
+    async fn remote_delta_notification_ignores_self_and_stale_seqnos() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
+            accepted_seqno: 8,
+            ..test_device_state([0; 32], [0; 32])
+        }));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
+        let relay = std::sync::Arc::new(MemoryRelay::new());
+        relay.insert_delta(sample_delta("peer-1", 9));
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder { tree });
+        let chunker = LocalChunker::open();
+
+        let mut engine = SyncEngine::open(
+            config.clone(),
+            meta_store,
+            obj_store,
+            blob_store,
+            blob_worker,
+            applier,
+            relay,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        engine
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(
+                DeltaAnnouncement {
+                    repo_id: config.repo_id.clone(),
+                    device: config.device_id.clone(),
+                    seqno: 9,
+                },
+            )))
+            .await
+            .unwrap();
+        assert_eq!(engine.state.accepted_seqno, 8);
+
+        engine
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(
+                DeltaAnnouncement {
+                    repo_id: config.repo_id.clone(),
+                    device: "peer-1".into(),
+                    seqno: 8,
+                },
+            )))
+            .await
+            .unwrap();
+        assert_eq!(engine.state.accepted_seqno, 8);
+    }
+
+    #[tokio::test]
     async fn remote_snapshot_notification_recognizes_current_snapshot() {
         let dir = tempdir().unwrap();
         let sync_root = dir.path().join("sync");
@@ -2425,6 +2619,22 @@ mod tests {
                 to_inclusive: 12,
             })
         );
+    }
+
+    fn sample_delta(device_id: &str, seqno: crate::core::SeqNo) -> Delta {
+        let mut delta = Delta {
+            hash: [0; 32],
+            seqno,
+            base_seqno: seqno.saturating_sub(1),
+            device_id: device_id.into(),
+            revision: seqno,
+            timestamp: SystemTime::now(),
+            changes: vec![crate::core::FileOp::CreateDir {
+                path: format!("docs-{seqno}"),
+            }],
+        };
+        delta.update_hash();
+        delta
     }
 
     fn sample_config_and_tree(sync_root: PathBuf) -> (Config, File, Tree) {

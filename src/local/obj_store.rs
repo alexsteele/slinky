@@ -1,18 +1,14 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{from_str, to_string};
 
-use crate::core::{BlobHash, Config, File, FileKind, Object, ObjectHash, Tree, TreeEntry};
-use crate::local::util::{device_root, encode_hash, hash_bytes, walk_files};
+use crate::core::{Config, Object};
+use crate::local::util::{device_root, encode_hash};
 use crate::services::{ObjStore, Result, SyncError};
 
 pub struct LocalObjStore {
-    config: Config,
     conn: Mutex<Connection>,
 }
 
@@ -35,49 +31,8 @@ impl LocalObjStore {
         .map_err(|err| SyncError::InvalidState(err.to_string()))?;
 
         Ok(Arc::new(Self {
-            config: config.clone(),
             conn: Mutex::new(conn),
         }))
-    }
-
-    async fn save_tree_from_root(&self, expected: &Tree) -> Result<()> {
-        let mut objects = Vec::new();
-        let mut root_paths = Vec::new();
-        let mut pending_root = PendingTree::default();
-
-        walk_files(
-            &self.config.sync_root,
-            &self.config.sync_root,
-            &mut root_paths,
-        )?;
-
-        for path in root_paths {
-            let full_path = self.config.sync_root.join(&path);
-            let data = fs::read(&full_path)?;
-            let blob_hash: BlobHash = hash_bytes(&data);
-            let mut file = File {
-                path: path.to_string_lossy().into_owned(),
-                hash: [0; 32],
-                blobs: vec![blob_hash],
-            };
-            file.update_hash();
-            pending_root.insert(&path, file)?;
-        }
-
-        let (root, mut tree_objects) = pending_root.finalize();
-        if root.hash != expected.hash {
-            return Err(SyncError::InvalidState(
-                "persisted tree did not match built tree".into(),
-            ));
-        }
-
-        objects.append(&mut tree_objects);
-        for object in &objects {
-            self.insert_object(object)?;
-        }
-        self.insert_object(&Object::Tree(root))?;
-
-        Ok(())
     }
 
     fn insert_object(&self, object: &Object) -> Result<()> {
@@ -112,83 +67,7 @@ impl ObjStore for LocalObjStore {
     }
 
     async fn save_object(&self, object: &Object) -> Result<()> {
-        match object {
-            Object::Tree(tree) => self.save_tree_from_root(tree).await,
-            _ => self.insert_object(object),
-        }
-    }
-}
-
-#[derive(Default)]
-struct PendingTree {
-    trees: BTreeMap<String, PendingTree>,
-    files: BTreeMap<String, File>,
-}
-
-impl PendingTree {
-    fn insert(&mut self, path: &Path, file: File) -> Result<()> {
-        let mut current = self;
-        let mut components = path.components().peekable();
-        let mut pending_file = Some(file);
-
-        while let Some(component) = components.next() {
-            let name = component_name(component)?;
-            if components.peek().is_some() {
-                current = current.trees.entry(name).or_default();
-            } else {
-                let file = pending_file.take().ok_or_else(|| {
-                    SyncError::InvalidState("missing file metadata during tree insert".into())
-                })?;
-                current.files.insert(name, file);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn finalize(self) -> (Tree, Vec<Object>) {
-        if self.trees.is_empty() && self.files.is_empty() {
-            return (Tree::empty(), Vec::new());
-        }
-
-        let mut entries = Vec::new();
-        let mut objects = Vec::new();
-
-        for (name, child) in self.trees {
-            let (tree, mut child_objects) = child.finalize();
-            entries.push(TreeEntry {
-                name,
-                kind: FileKind::Folder,
-                hash: ObjectHash::Tree(tree.hash),
-            });
-            objects.append(&mut child_objects);
-            objects.push(Object::Tree(tree));
-        }
-
-        for (name, file) in self.files {
-            entries.push(TreeEntry {
-                name,
-                kind: FileKind::File,
-                hash: ObjectHash::File(file.hash),
-            });
-            objects.push(Object::File(file));
-        }
-
-        let mut tree = Tree {
-            hash: [0; 32],
-            entries,
-        };
-        tree.update_hash();
-        (tree, objects)
-    }
-}
-
-fn component_name(component: Component<'_>) -> Result<String> {
-    match component {
-        Component::Normal(name) => Ok(name.to_string_lossy().into_owned()),
-        _ => Err(SyncError::InvalidState(
-            "tree builder expected relative file paths".into(),
-        )),
+        self.insert_object(object)
     }
 }
 
@@ -217,9 +96,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::LocalObjStore;
-    use crate::core::{Config, DeviceCredentials, Object, ObjectHash, ObjectId};
-    use crate::local::LocalTreeBuilder;
-    use crate::services::TreeBuilder;
+    use crate::core::{
+        Config, DeviceCredentials, File, FileKind, Object, ObjectHash, ObjectId, Tree, TreeEntry,
+    };
+    use crate::local::util::hash_bytes;
 
     #[tokio::test]
     async fn saves_tree_objects_without_blob_data() {
@@ -228,7 +108,6 @@ mod tests {
         std::fs::write(dir.path().join("docs/readme.md"), b"readme").unwrap();
         std::fs::write(dir.path().join("docs/guides/intro.md"), b"intro").unwrap();
 
-        let builder = LocalTreeBuilder::new(crate::local::LocalChunker::open());
         let obj_store = LocalObjStore::open(&Config {
             sync_root: dir.path().to_path_buf(),
             repo_id: format!("repo-{}", dir.path().display()),
@@ -240,13 +119,67 @@ mod tests {
         })
         .unwrap();
 
-        let tree = builder.build_tree(dir.path()).await.unwrap();
-        obj_store
-            .save_object(&Object::Tree(tree.clone()))
-            .await
-            .unwrap();
+        let mut readme = File {
+            path: "docs/readme.md".into(),
+            hash: [0; 32],
+            blobs: vec![hash_bytes(b"readme")],
+        };
+        readme.update_hash();
+        let mut intro = File {
+            path: "docs/guides/intro.md".into(),
+            hash: [0; 32],
+            blobs: vec![hash_bytes(b"intro")],
+        };
+        intro.update_hash();
 
-        let docs_entry = tree
+        let mut guides_tree = Tree {
+            hash: [0; 32],
+            entries: vec![TreeEntry {
+                name: "intro.md".into(),
+                kind: FileKind::File,
+                hash: ObjectHash::File(intro.hash),
+            }],
+        };
+        guides_tree.update_hash();
+
+        let mut docs_tree = Tree {
+            hash: [0; 32],
+            entries: vec![
+                TreeEntry {
+                    name: "guides".into(),
+                    kind: FileKind::Folder,
+                    hash: ObjectHash::Tree(guides_tree.hash),
+                },
+                TreeEntry {
+                    name: "readme.md".into(),
+                    kind: FileKind::File,
+                    hash: ObjectHash::File(readme.hash),
+                },
+            ],
+        };
+        docs_tree.update_hash();
+
+        let mut root = Tree {
+            hash: [0; 32],
+            entries: vec![TreeEntry {
+                name: "docs".into(),
+                kind: FileKind::Folder,
+                hash: ObjectHash::Tree(docs_tree.hash),
+            }],
+        };
+        root.update_hash();
+
+        for object in [
+            Object::File(readme.clone()),
+            Object::File(intro.clone()),
+            Object::Tree(guides_tree.clone()),
+            Object::Tree(docs_tree.clone()),
+            Object::Tree(root.clone()),
+        ] {
+            obj_store.save_object(&object).await.unwrap();
+        }
+
+        let docs_entry = root
             .entries
             .iter()
             .find(|entry| entry.name == "docs")

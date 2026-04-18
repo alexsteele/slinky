@@ -4,5 +4,6 @@ pub mod device;
 pub mod engine;
 pub mod index;
 pub mod local;
+pub mod relay;
 pub mod runtime;
 pub mod services;

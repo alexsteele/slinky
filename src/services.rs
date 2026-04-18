@@ -1,7 +1,7 @@
 //! Service boundaries for the sync engine.
 //!
 //! These traits define the seams between the serialized engine and the outside world: persistence,
-//! relay I/O, filesystem observation, tree construction, reconciliation, and apply.
+//! filesystem observation, tree construction, reconciliation, and apply.
 
 use std::path::{Path, PathBuf};
 
@@ -9,110 +9,12 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::core::{
-    Blob, BlobHash, ChangeSet, Checkpoint, CheckpointAnnouncement, Config, Delta,
-    DeltaAnnouncement, DeltaWindow, DeviceId, DeviceState, File, Frontier, FullBlob, Object,
-    ObjectId, PeerState, RepoId, SeqNo, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
+    Blob, BlobHash, Config, DeviceId, DeviceState, File, Frontier, FullBlob, Object, ObjectId,
+    RepoId, Snapshot, SnapshotHash, Tree,
 };
 use crate::engine::{ApplyJob, BlobTransferJob, BlobTransferResult};
 
 pub type Result<T> = std::result::Result<T, SyncError>;
-
-#[async_trait]
-pub trait Relay: Send + Sync {
-    /// Ensures the relay knows about this device before sync begins.
-    /// Register a device with the relay for its repo.
-    async fn register_device(&self, config: &Config) -> Result<()>;
-
-    /// Subscribe to pushed relay notifications for a device.
-    async fn subscribe(
-        &self,
-        repo_id: &RepoId,
-        device_id: &DeviceId,
-    ) -> Result<RelayNotificationStream>;
-
-    /// Publish a new snapshot plus its journal diff to the relay.
-    async fn publish_snapshot(&self, snapshot: &Snapshot, change_set: &ChangeSet) -> Result<()>;
-
-    /// Publish one ordered delta into the relay-backed log.
-    ///
-    /// The hybrid model expects this to become the normal hot path once the engine is migrated.
-    async fn publish_delta(&self, _delta: &Delta) -> Result<()> {
-        Err(SyncError::InvalidState(
-            "publish_delta not implemented".into(),
-        ))
-    }
-
-    /// Publish a checkpoint that binds a local snapshot to a relay seqno.
-    async fn publish_checkpoint(&self, _checkpoint: &Checkpoint) -> Result<()> {
-        Err(SyncError::InvalidState(
-            "publish_checkpoint not implemented".into(),
-        ))
-    }
-
-    /// Fetch snapshot metadata by hash.
-    async fn fetch_snapshot(&self, repo_id: &RepoId, hash: &SnapshotHash) -> Result<Snapshot>;
-
-    /// Fetch the ChangeSet between `base` and`target`.
-    async fn fetch_change_set(
-        &self,
-        repo_id: &RepoId,
-        base: &SnapshotHash,
-        target: &SnapshotHash,
-    ) -> Result<ChangeSet>;
-
-    /// Fetch one delta by its ordered seqno.
-    async fn fetch_delta(&self, _repo_id: &RepoId, _seqno: SeqNo) -> Result<Delta> {
-        Err(SyncError::NotFound)
-    }
-
-    /// Fetch deltas after one seqno, up to and including another.
-    async fn fetch_deltas(
-        &self,
-        _repo_id: &RepoId,
-        _from_exclusive: SeqNo,
-        _to_inclusive: SeqNo,
-    ) -> Result<Vec<Delta>> {
-        Ok(Vec::new())
-    }
-
-    /// Fetch deltas for one replay window using `(from, to]` semantics.
-    async fn fetch_delta_window(
-        &self,
-        repo_id: &RepoId,
-        window: &DeltaWindow,
-    ) -> Result<Vec<Delta>> {
-        self.fetch_deltas(repo_id, window.from_exclusive, window.to_inclusive)
-            .await
-    }
-
-    /// Fetch the latest checkpoint at or before the requested seqno.
-    async fn fetch_checkpoint(
-        &self,
-        _repo_id: &RepoId,
-        _upto_seqno: SeqNo,
-    ) -> Result<Option<Checkpoint>> {
-        Ok(None)
-    }
-
-    /// Fetch the relay's current ordered log head for a repo.
-    async fn fetch_head_seqno(&self, _repo_id: &RepoId) -> Result<SeqNo> {
-        Ok(0)
-    }
-
-    /// Fetch the latest known device frontier for a repo.
-    async fn fetch_frontier(&self, repo_id: &RepoId) -> Result<Frontier>;
-}
-
-/// Push notification from the relay control plane.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RelayNotification {
-    Snapshot(SnapshotAnnouncement),
-    Delta(DeltaAnnouncement),
-    Checkpoint(CheckpointAnnouncement),
-    PeerAvailable(PeerState),
-}
-
-pub type RelayNotificationStream = mpsc::Receiver<RelayNotification>;
 
 /// Shared sync error type used across local services and runtime workers.
 #[derive(Debug)]

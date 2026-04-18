@@ -7,17 +7,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::core::{
-    BlobHash, ChangeSet, Config, DeltaWindow, DeviceId, DeviceState, File, Object, ObjectId,
-    Snapshot, SnapshotAnnouncement, SnapshotHash, Tree, TreeDiff,
+    BlobHash, ChangeSet, Config, DeltaWindow, DeviceId, DeviceState, File, FileChange, FileOp,
+    Object, ObjectId, PendingDelta, Revision, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
+    TreeDiff,
 };
 use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
 use crate::local::util::{encode_hash, walk_files};
+use crate::relay::{Relay, RelayEvent};
 use crate::services::{
     Applier, ApplyOp, ApplyPlan, BlobStore, BlobTransferWorker, Chunker, MetaStore, ObjStore,
-    Relay, RelayNotification, Result, TreeBuilder, WatcherEvent,
+    Result, TreeBuilder, WatcherEvent,
 };
 
 /// Serialized device-side sync state machine.
@@ -38,6 +41,7 @@ pub struct SyncEngine {
     pub relay: Arc<dyn Relay>,
     pub tree_builder: Arc<dyn TreeBuilder>,
     pub chunker: Arc<dyn Chunker>,
+    pub pending_deltas: Vec<PendingDelta>,
 }
 
 /// Upload or download request for referenced blob content.
@@ -70,7 +74,7 @@ struct FileBuild {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
     Local(WatcherEvent),
-    Remote(RelayNotification),
+    Remote(RelayEvent),
 }
 
 impl SyncEngine {
@@ -190,10 +194,11 @@ impl SyncEngine {
             relay,
             tree_builder,
             chunker,
+            pending_deltas: Vec::new(),
         })
     }
 
-    /// Builds the current local tree and publishes a new snapshot if it changed.
+    /// Builds the current local tree and publishes a checkpoint snapshot if it changed.
     pub async fn start(&mut self) -> Result<SnapshotHash> {
         self.log("registering device with relay");
         self.relay.register_device(&self.config).await?;
@@ -242,26 +247,24 @@ impl SyncEngine {
         }
     }
 
-    async fn handle_remote_notification(&mut self, notification: RelayNotification) -> Result<()> {
+    async fn handle_remote_notification(&mut self, notification: RelayEvent) -> Result<()> {
         match notification {
-            RelayNotification::Snapshot(announcement) => {
-                self.handle_remote_snapshot(announcement).await
-            }
-            RelayNotification::Delta(announcement) => {
+            RelayEvent::Snapshot(announcement) => self.handle_remote_snapshot(announcement).await,
+            RelayEvent::Delta(announcement) => {
                 self.log(&format!(
                     "delta announcement scaffold: {} {}",
                     announcement.device, announcement.seqno
                 ));
                 Ok(())
             }
-            RelayNotification::Checkpoint(announcement) => {
+            RelayEvent::Checkpoint(announcement) => {
                 self.log(&format!(
                     "checkpoint announcement scaffold: {} {}",
                     announcement.device, announcement.checkpoint.seqno
                 ));
                 Ok(())
             }
-            RelayNotification::PeerAvailable(peer) => {
+            RelayEvent::PeerAvailable(peer) => {
                 self.log(&format!("peer available: {:?}", peer));
                 self.state
                     .frontier
@@ -443,7 +446,7 @@ impl SyncEngine {
         self.publish_update(reason, update).await
     }
 
-    /// Publishes a tree update if it changed from the current in-memory root.
+    /// Publishes a full checkpoint snapshot for the current tree update.
     async fn publish_update(&mut self, reason: &str, update: TreeUpdate) -> Result<SnapshotHash> {
         let tree = update.root.clone();
         if self.tree.hash == tree.hash {
@@ -458,14 +461,9 @@ impl SyncEngine {
 
         // Persist the immutable objects locally before advertising the new snapshot.
         self.log("saving tree metadata to object db");
-        for file in &update.files {
-            self.obj_store
-                .save_object(&Object::File(file.clone()))
-                .await?;
+        for object in update.objects() {
+            self.obj_store.save_object(&object).await?;
         }
-        self.obj_store
-            .save_object(&Object::Tree(tree.clone()))
-            .await?;
         let change_set = ChangeSet {
             base: published_snapshot,
             target: snapshot.hash,
@@ -508,9 +506,24 @@ impl SyncEngine {
             return self.sync_removed_path(path, "local change").await;
         }
 
+        let base_file = self.index.file_at_path(&relative)?.map(|file| file.hash);
         let build = self.build_file(&relative).await?;
         let update = self.index.upsert_file(&relative, build.file)?;
-        self.publish_update("local change", update).await
+        let changed_file = update.files.last().cloned().ok_or_else(|| {
+            crate::services::SyncError::InvalidState(
+                "file change update is missing file metadata".into(),
+            )
+        })?;
+        self.apply_local_update(
+            "local change",
+            update,
+            vec![FileOp::Modify(FileChange {
+                path: relative.to_string_lossy().into_owned(),
+                base_file,
+                file: changed_file,
+            })],
+        )
+        .await
     }
 
     async fn sync_created_directory(&mut self, path: &Path) -> Result<SnapshotHash> {
@@ -523,7 +536,14 @@ impl SyncEngine {
             Ok(update) => update,
             Err(_) => return self.full_sync("local directory create").await,
         };
-        self.publish_update("local directory create", update).await
+        self.apply_local_update(
+            "local directory create",
+            update,
+            vec![FileOp::CreateDir {
+                path: relative.to_string_lossy().into_owned(),
+            }],
+        )
+        .await
     }
 
     async fn sync_removed_path(&mut self, path: &Path, reason: &str) -> Result<SnapshotHash> {
@@ -533,7 +553,14 @@ impl SyncEngine {
         };
 
         let update = self.index.remove_path(&relative)?;
-        self.publish_update(reason, update).await
+        self.apply_local_update(
+            reason,
+            update,
+            vec![FileOp::Remove {
+                path: relative.to_string_lossy().into_owned(),
+            }],
+        )
+        .await
     }
 
     async fn sync_moved_path(&mut self, from: &Path, to: &Path) -> Result<SnapshotHash> {
@@ -547,7 +574,88 @@ impl SyncEngine {
         };
 
         let update = self.index.move_path(&from_relative, &to_relative)?;
-        self.publish_update("local change", update).await
+        self.apply_local_update(
+            "local change",
+            update,
+            vec![FileOp::Move {
+                from: from_relative.to_string_lossy().into_owned(),
+                to: to_relative.to_string_lossy().into_owned(),
+            }],
+        )
+        .await
+    }
+
+    /// Applies one local tree mutation, records a delta, and keeps the live tree current.
+    async fn apply_local_update(
+        &mut self,
+        reason: &str,
+        update: TreeUpdate,
+        changes: Vec<FileOp>,
+    ) -> Result<SnapshotHash> {
+        let tree = update.root.clone();
+        if self.tree.hash == tree.hash {
+            self.log(&format!("{reason} tree unchanged"));
+            return Ok(self.state.snapshot);
+        }
+
+        self.log("saving local tree metadata");
+        for object in update.objects() {
+            self.obj_store.save_object(&object).await?;
+        }
+
+        self.tree = tree;
+        self.record_local_delta(changes)?;
+        self.save_state().await?;
+        self.flush_pending_deltas().await?;
+        self.maybe_checkpoint().await?;
+        self.log(&format!(
+            "{reason} applied locally without checkpoint; pending deltas={}",
+            self.pending_deltas.len()
+        ));
+        Ok(self.state.snapshot)
+    }
+
+    /// Records one local delta against the current accepted relay position.
+    fn record_local_delta(&mut self, changes: Vec<FileOp>) -> Result<Revision> {
+        if changes.is_empty() {
+            return Err(crate::services::SyncError::InvalidState(
+                "local delta is missing changes".into(),
+            ));
+        }
+
+        let revision = self.state.next_revision;
+        self.pending_deltas.push(PendingDelta {
+            device_id: self.config.device_id.clone(),
+            revision,
+            base_seqno: self.state.accepted_seqno,
+            timestamp: SystemTime::now(),
+            changes,
+        });
+        self.state.next_revision += 1;
+        Ok(revision)
+    }
+
+    /// Flushes pending deltas toward the relay.
+    ///
+    /// The current scaffold keeps the queue local until the relay delta publish path is wired up.
+    async fn flush_pending_deltas(&mut self) -> Result<()> {
+        if self.pending_deltas.is_empty() {
+            return Ok(());
+        }
+
+        self.log(&format!(
+            "pending delta flush scaffold: {} queued",
+            self.pending_deltas.len()
+        ));
+        Ok(())
+    }
+
+    /// Publishes an occasional checkpoint snapshot for the current live tree.
+    ///
+    /// The current scaffold keeps checkpoint policy disabled while the hot delta path is taking
+    /// shape.
+    async fn maybe_checkpoint(&mut self) -> Result<()> {
+        Ok(())
     }
 
     async fn save_state(&self) -> Result<()> {
@@ -606,7 +714,27 @@ impl SyncEngine {
     }
 
     fn relative_path(&self, path: &Path) -> Option<PathBuf> {
-        path.strip_prefix(&self.config.sync_root)
+        if let Ok(relative) = path.strip_prefix(&self.config.sync_root) {
+            return Some(relative.to_path_buf());
+        }
+
+        let root = self.config.sync_root.as_path();
+        let private_prefix = Path::new("/private");
+        if let Ok(trimmed_path) = path.strip_prefix(private_prefix) {
+            if let Ok(relative) = trimmed_path.strip_prefix(root) {
+                return Some(relative.to_path_buf());
+            }
+        }
+        if let Ok(trimmed_root) = root.strip_prefix(private_prefix) {
+            if let Ok(relative) = path.strip_prefix(trimmed_root) {
+                return Some(relative.to_path_buf());
+            }
+        }
+
+        let canonical_root = std::fs::canonicalize(&self.config.sync_root).ok()?;
+        let canonical_path = std::fs::canonicalize(path).ok()?;
+        canonical_path
+            .strip_prefix(canonical_root)
             .ok()
             .map(Path::to_path_buf)
     }
@@ -884,9 +1012,10 @@ mod tests {
     };
     use crate::local::util::hash_bytes;
     use crate::local::{LocalApplier, LocalChunker, build_snapshot};
+    use crate::relay::{Relay, RelayEvent, RelayEventStream};
     use crate::services::{
-        Applier, ApplyOp, ApplyPlan, BlobStore, BlobTransferWorker, MetaStore, ObjStore, Relay,
-        RelayNotification, RelayNotificationStream, Result, SyncError, TreeBuilder, WatcherEvent,
+        Applier, ApplyOp, ApplyPlan, BlobStore, BlobTransferWorker, MetaStore, ObjStore, Result,
+        SyncError, TreeBuilder, WatcherEvent,
     };
 
     struct MemoryMetaStore {
@@ -1146,7 +1275,7 @@ mod tests {
             &self,
             _repo_id: &String,
             _device_id: &String,
-        ) -> Result<RelayNotificationStream> {
+        ) -> Result<RelayEventStream> {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
             Ok(rx)
         }
@@ -1376,14 +1505,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(tree_builder.calls(), 1);
-        assert_ne!(after, before);
+        assert_eq!(after, before);
+        assert_eq!(engine.state.snapshot, before);
         assert_ne!(engine.tree.hash, tree.hash);
+        assert_eq!(engine.pending_deltas.len(), 1);
+        assert!(matches!(
+            &engine.pending_deltas[0].changes[..],
+            [crate::core::FileOp::Modify(_)]
+        ));
         assert!(matches!(
             obj_store
-                .load_object(&ObjectId::Snapshot(after))
+                .load_object(&ObjectId::Tree(engine.tree.hash))
                 .await
                 .unwrap(),
-            Object::Snapshot(_)
+            Object::Tree(_)
         ));
     }
 
@@ -1435,8 +1570,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(tree_builder.calls(), 1);
-        assert_ne!(after, before);
+        assert_eq!(after, before);
         assert!(engine.tree.entries.is_empty());
+        assert_eq!(engine.pending_deltas.len(), 1);
+        assert_eq!(
+            engine.pending_deltas[0].changes,
+            vec![crate::core::FileOp::Remove {
+                path: "docs".into(),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -1488,7 +1630,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tree_builder.calls(), 1);
-        assert_ne!(after, before);
+        assert_eq!(after, before);
         assert!(
             engine
                 .index
@@ -1502,6 +1644,13 @@ mod tests {
                 .resolve_path(Path::new("docs"))
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(engine.pending_deltas.len(), 1);
+        assert_eq!(
+            engine.pending_deltas[0].changes,
+            vec![crate::core::FileOp::Remove {
+                path: "docs/guide.md".into(),
+            }]
         );
     }
 
@@ -1560,8 +1709,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(tree_builder.calls(), 1);
-        assert_ne!(after, before);
+        assert_eq!(after, before);
         assert_eq!(blob_store.len(), 1);
+        assert_eq!(engine.pending_deltas.len(), 1);
+        assert_eq!(
+            engine.pending_deltas[0].changes,
+            vec![crate::core::FileOp::Move {
+                from: "docs/guide.md".into(),
+                to: "guides/guide.md".into(),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -1610,7 +1767,7 @@ mod tests {
         coordinator.insert_change_set(remote_change_set);
 
         engine
-            .handle_event(super::SyncEvent::Remote(RelayNotification::Snapshot(
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Snapshot(
                 SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: remote_snapshot.hash,
@@ -1683,7 +1840,7 @@ mod tests {
         .unwrap();
 
         engine
-            .handle_event(super::SyncEvent::Remote(RelayNotification::Snapshot(
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Snapshot(
                 SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: tip_snapshot.hash,
@@ -1917,7 +2074,7 @@ mod tests {
         .unwrap();
 
         engine
-            .handle_event(super::SyncEvent::Remote(RelayNotification::Snapshot(
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Snapshot(
                 SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: target_snapshot.hash,
@@ -1970,7 +2127,7 @@ mod tests {
         coordinator.insert_snapshot(remote_snapshot.clone());
 
         engine
-            .handle_event(super::SyncEvent::Remote(RelayNotification::Snapshot(
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Snapshot(
                 SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: remote_snapshot.hash,
@@ -2039,7 +2196,7 @@ mod tests {
         coordinator.insert_change_set(remote_change_set);
 
         engine
-            .handle_event(super::SyncEvent::Remote(RelayNotification::Snapshot(
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Snapshot(
                 SnapshotAnnouncement {
                     repo_id: config.repo_id.clone(),
                     snapshot: remote_snapshot.hash,

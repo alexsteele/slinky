@@ -6,10 +6,11 @@ use crate::local::{
     FsWatcher, LocalApplier, LocalBlobStore, LocalBlobTransferWorker, LocalChunker, LocalMetaStore,
     LocalObjStore, LocalTreeBuilder, NoopRelay, load_config,
 };
+use crate::relay::Relay;
 use crate::runtime::SyncService;
 use crate::services::{
-    Applier, BlobStore, BlobTransferWorker, Chunker, MetaStore, ObjStore, Relay, Result,
-    TreeBuilder, Watcher,
+    Applier, BlobStore, BlobTransferWorker, Chunker, MetaStore, ObjStore, Result, TreeBuilder,
+    Watcher,
 };
 
 /// Device is the top-level assembled local node.
@@ -217,14 +218,16 @@ mod tests {
             .unwrap();
 
         std::fs::write(sync_root.join("hello.txt"), b"hello updated").unwrap();
-        let updated_snapshot =
-            wait_for_snapshot_change(&device, meta_store.clone(), initial_state.snapshot).await;
+        let next_revision =
+            wait_for_local_revision(&device, meta_store.clone(), initial_state.next_revision).await;
 
         device.stop().await.unwrap();
         device.join().await.unwrap();
 
         let engine = device.service.engine.as_ref().unwrap();
-        assert_eq!(engine.state.snapshot, updated_snapshot);
+        assert_eq!(engine.state.snapshot, initial_state.snapshot);
+        assert_eq!(engine.state.next_revision, next_revision);
+        assert!(!engine.pending_deltas.is_empty());
         assert!(
             engine
                 .tree
@@ -258,21 +261,13 @@ mod tests {
         let mut device = Device::open(config).await.unwrap();
         device.start().await.unwrap();
 
-        let meta_store = LocalMetaStore::open(device.config.clone()).unwrap();
-        let initial_state = meta_store
-            .load_state(&device.config.repo_id, &device.config.device_id)
-            .await
-            .unwrap();
-
         std::fs::remove_dir_all(sync_root.join("docs")).unwrap();
-        let updated_snapshot =
-            wait_for_snapshot_change(&device, meta_store.clone(), initial_state.snapshot).await;
+        sleep(Duration::from_millis(500)).await;
 
         device.stop().await.unwrap();
         device.join().await.unwrap();
 
         let engine = device.service.engine.as_ref().unwrap();
-        assert_eq!(engine.state.snapshot, updated_snapshot);
         assert!(engine.tree.entries.is_empty());
     }
 
@@ -300,21 +295,13 @@ mod tests {
         let mut device = Device::open(config).await.unwrap();
         device.start().await.unwrap();
 
-        let meta_store = LocalMetaStore::open(device.config.clone()).unwrap();
-        let initial_state = meta_store
-            .load_state(&device.config.repo_id, &device.config.device_id)
-            .await
-            .unwrap();
-
         std::fs::remove_file(sync_root.join("docs/guide.md")).unwrap();
-        let updated_snapshot =
-            wait_for_snapshot_change(&device, meta_store.clone(), initial_state.snapshot).await;
+        sleep(Duration::from_millis(500)).await;
 
         device.stop().await.unwrap();
         device.join().await.unwrap();
 
         let engine = device.service.engine.as_ref().unwrap();
-        assert_eq!(engine.state.snapshot, updated_snapshot);
         assert!(
             engine
                 .index
@@ -410,23 +397,15 @@ mod tests {
         let mut device = Device::open(config).await.unwrap();
         device.start().await.unwrap();
 
-        let meta_store = LocalMetaStore::open(device.config.clone()).unwrap();
-        let initial_state = meta_store
-            .load_state(&device.config.repo_id, &device.config.device_id)
-            .await
-            .unwrap();
-
         std::fs::create_dir_all(sync_root.join("guides")).unwrap();
         let to_path = sync_root.join("guides/guide.md");
         std::fs::rename(&from_path, &to_path).unwrap();
-        let updated_snapshot =
-            wait_for_snapshot_change(&device, meta_store.clone(), initial_state.snapshot).await;
+        sleep(Duration::from_millis(500)).await;
 
         device.stop().await.unwrap();
         device.join().await.unwrap();
 
         let engine = device.service.engine.as_ref().unwrap();
-        assert_eq!(engine.state.snapshot, updated_snapshot);
         assert!(
             engine
                 .tree
@@ -469,14 +448,16 @@ mod tests {
 
         std::fs::create_dir_all(sync_root.join("docs")).unwrap();
         std::fs::write(sync_root.join("docs/guide.md"), b"guide").unwrap();
-        let updated_snapshot =
-            wait_for_snapshot_change(&device, meta_store.clone(), initial_state.snapshot).await;
+        let next_revision =
+            wait_for_local_revision(&device, meta_store.clone(), initial_state.next_revision).await;
 
         device.stop().await.unwrap();
         device.join().await.unwrap();
 
         let engine = device.service.engine.as_ref().unwrap();
-        assert_eq!(engine.state.snapshot, updated_snapshot);
+        assert_eq!(engine.state.snapshot, initial_state.snapshot);
+        assert_eq!(engine.state.next_revision, next_revision);
+        assert!(engine.pending_deltas.len() >= 2);
 
         let docs_id = engine
             .index
@@ -491,23 +472,23 @@ mod tests {
         assert!(guide_id.is_some());
     }
 
-    async fn wait_for_snapshot_change(
+    async fn wait_for_local_revision(
         device: &Device,
         meta_store: Arc<dyn crate::services::MetaStore>,
-        previous: [u8; 32],
-    ) -> [u8; 32] {
+        previous: u64,
+    ) -> u64 {
         for _ in 0..20 {
-            let snapshot = meta_store
+            let next_revision = meta_store
                 .load_state(&device.config.repo_id, &device.config.device_id)
                 .await
                 .unwrap()
-                .snapshot;
-            if snapshot != previous {
-                return snapshot;
+                .next_revision;
+            if next_revision > previous {
+                return next_revision;
             }
             sleep(Duration::from_millis(200)).await;
         }
 
-        panic!("timed out waiting for snapshot change");
+        panic!("timed out waiting for local revision change");
     }
 }

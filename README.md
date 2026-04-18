@@ -64,7 +64,8 @@ Checkpoint snapshot + accepted SeqNo
 
 ## Auth
 
-Devices are identified by a keypair. Communications go over encrypted TCP/http.
+Devices are identified by a keypair. Communications go over encrypted HTTPs.
+Relay authenticates devices with a signing challenge and session tokens.
 
 ## Commands
 

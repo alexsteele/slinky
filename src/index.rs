@@ -128,6 +128,19 @@ impl TreeIndex {
         Ok(Some(current))
     }
 
+    /// Returns the current file metadata at one relative path, if it exists as a file.
+    pub fn file_at_path(&self, path: &Path) -> Result<Option<File>> {
+        let Some(node_id) = self.resolve_path(path)? else {
+            return Ok(None);
+        };
+
+        let node = self.node(node_id)?;
+        match &node.kind {
+            NodeKind::File { file } => Ok(Some(file.clone())),
+            NodeKind::Tree { .. } => Ok(None),
+        }
+    }
+
     /// Insert or replace a file node at a relative path.
     pub fn upsert_file(&mut self, path: &Path, file: File) -> Result<TreeUpdate> {
         let components = path_components(path)?;

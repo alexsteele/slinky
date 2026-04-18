@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::core::{ChangeSet, Checkpoint, Config, Delta, Frontier, SeqNo, Snapshot, SnapshotHash};
-use crate::services::{Relay, RelayNotificationStream, Result, SyncError};
+use crate::relay::{Relay, RelayEventStream};
+use crate::services::{Result, SyncError};
 
 pub struct NoopRelay;
 
@@ -12,11 +13,7 @@ impl Relay for NoopRelay {
         Ok(())
     }
 
-    async fn subscribe(
-        &self,
-        _repo_id: &String,
-        _device_id: &String,
-    ) -> Result<RelayNotificationStream> {
+    async fn subscribe(&self, _repo_id: &String, _device_id: &String) -> Result<RelayEventStream> {
         let (_tx, rx) = mpsc::channel(1);
         Ok(rx)
     }

@@ -11,8 +11,8 @@ use std::time::SystemTime;
 
 use crate::core::{
     BlobHash, ChangeSet, Config, Delta, DeltaWindow, DeviceId, DeviceState, File, FileChange,
-    FileOp, Object, ObjectId, PendingDelta, Revision, Snapshot, SnapshotAnnouncement, SnapshotHash,
-    Tree, TreeDiff,
+    FileOp, Object, ObjectId, PendingDelta, Revision, Snapshot, SnapshotAnnouncement,
+    SnapshotHash, Tree, TreeDiff,
 };
 use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
@@ -175,17 +175,19 @@ impl SyncEngine {
         let state = meta_store
             .load_state(&config.repo_id, &config.device_id)
             .await?;
-        let current_tree = if state.snapshot == [0; 32] {
-            Tree::empty()
+        let (current_tree, index) = if state.snapshot == [0; 32] {
+            (Tree::empty(), TreeIndex::empty())
         } else {
-            Self::load_saved_tree(&*obj_store, state.snapshot).await?
+            let tree = Self::load_saved_tree(&*obj_store, state.snapshot).await?;
+            let index = TreeIndex::hydrate(tree.clone(), &*obj_store).await?;
+            (tree, index)
         };
 
         Ok(Self {
             config,
             state,
             tree: current_tree,
-            index: TreeIndex::empty(),
+            index,
             meta_store,
             obj_store,
             blob_store,
@@ -1714,6 +1716,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_hydrates_saved_tree_index_before_start() {
+        let dir = tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+
+        let (config, file, docs_tree, root_tree) = sample_nested_config_and_tree(sync_root.clone());
+        let snapshot = build_snapshot(&config.device_id, root_tree.hash, Some(&[0; 32]));
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(test_device_state(
+            snapshot.hash,
+            snapshot.hash,
+        )));
+        let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::File(file.clone()));
+        obj_store.insert(Object::Tree(docs_tree.clone()));
+        obj_store.insert(Object::Tree(root_tree.clone()));
+        obj_store.insert(Object::Snapshot(snapshot.clone()));
+        let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
+        let blob_worker = test_blob_worker(blob_store.clone());
+        let applier = test_applier();
+        let relay = std::sync::Arc::new(MemoryRelay::new());
+        let tree_builder = std::sync::Arc::new(FixedTreeBuilder {
+            tree: root_tree.clone(),
+        });
+        let chunker = LocalChunker::open();
+
+        let engine = SyncEngine::open(
+            config,
+            meta_store,
+            obj_store,
+            blob_store,
+            blob_worker,
+            applier,
+            relay,
+            tree_builder,
+            chunker,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(engine.tree.hash, root_tree.hash);
+        assert!(
+            engine
+                .index
+                .resolve_path(Path::new("docs/guide.md"))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            engine
+                .index
+                .file_at_path(Path::new("docs/guide.md"))
+                .unwrap(),
+            Some(file)
+        );
+    }
+
+    #[tokio::test]
     async fn directory_delete_updates_tree_without_rebuild() {
         let dir = tempdir().unwrap();
         let sync_root = dir.path().join("sync");
@@ -2086,7 +2145,7 @@ mod tests {
         let sync_root = dir.path().join("sync");
         std::fs::create_dir_all(&sync_root).unwrap();
 
-        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let (config, file, tree) = sample_config_and_tree(sync_root.clone());
         let base_snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
         let target_snapshot =
             build_snapshot(&"peer-1".to_string(), [3; 32], Some(&base_snapshot.hash));
@@ -2111,6 +2170,7 @@ mod tests {
             ..test_device_state(base_snapshot.hash, base_snapshot.hash)
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(tree.clone()));
         obj_store.insert(Object::Snapshot(base_snapshot.clone()));
         obj_store.insert(Object::Snapshot(target_snapshot.clone()));
@@ -2170,7 +2230,7 @@ mod tests {
         let sync_root = dir.path().join("sync");
         std::fs::create_dir_all(&sync_root).unwrap();
 
-        let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
+        let (config, file, tree) = sample_config_and_tree(sync_root.clone());
         let local_snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
         let remote_base = build_snapshot(&"peer-1".to_string(), [4; 32], Some(&[0; 32]));
         let remote_tip = build_snapshot(&"peer-1".to_string(), [5; 32], Some(&remote_base.hash));
@@ -2182,6 +2242,7 @@ mod tests {
             ..test_device_state(local_snapshot.hash, local_snapshot.hash)
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
+        obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(tree.clone()));
         obj_store.insert(Object::Snapshot(local_snapshot));
         obj_store.insert(Object::Snapshot(remote_tip));

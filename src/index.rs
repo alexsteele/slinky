@@ -6,10 +6,10 @@
 //! be saved.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
-use crate::core::{File, FileHash, FileKind, Object, ObjectHash, Tree, TreeEntry, TreeHash};
-use crate::services::{Result, SyncError};
+use crate::core::{File, FileHash, FileKind, Object, ObjectHash, ObjectId, Tree, TreeEntry, TreeHash};
+use crate::services::{ObjStore, Result, SyncError};
 
 pub type NodeId = u64;
 
@@ -103,6 +103,45 @@ impl TreeIndex {
     {
         let mut index = Self::empty();
         index.load_tree_node(index.root, root, load_tree, load_file)?;
+        Ok(index)
+    }
+
+    /// Hydrate an index from one persisted root tree and the object store behind it.
+    pub async fn hydrate(root: Tree, obj_store: &dyn ObjStore) -> Result<Self> {
+        let mut index = Self::empty();
+        let mut pending = vec![(root, PathBuf::new())];
+
+        while let Some((tree, prefix)) = pending.pop() {
+            for entry in tree.entries {
+                let path = prefix.join(&entry.name);
+                match entry.hash {
+                    ObjectHash::Tree(hash) => {
+                        index.ensure_directory(&path)?;
+                        let child = match obj_store.load_object(&ObjectId::Tree(hash)).await? {
+                            Object::Tree(tree) => tree,
+                            _ => {
+                                return Err(SyncError::InvalidState(
+                                    "tree object lookup returned wrong type".into(),
+                                ));
+                            }
+                        };
+                        pending.push((child, path));
+                    }
+                    ObjectHash::File(hash) => {
+                        let file = match obj_store.load_object(&ObjectId::File(hash)).await? {
+                            Object::File(file) => file,
+                            _ => {
+                                return Err(SyncError::InvalidState(
+                                    "file object lookup returned wrong type".into(),
+                                ));
+                            }
+                        };
+                        index.upsert_file(&path, file)?;
+                    }
+                }
+            }
+        }
+
         Ok(index)
     }
 
@@ -670,11 +709,17 @@ fn join_components(components: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
 
     use super::{NodeKind, TreeIndex, TreeUpdate};
-    use crate::core::{File, FileHash, FileKind, Object, ObjectHash, Tree, TreeEntry, TreeHash};
-    use crate::services::{Result, SyncError};
+    use crate::core::{
+        File, FileHash, FileKind, Object, ObjectHash, ObjectId, Tree, TreeEntry, TreeHash,
+    };
+    use crate::services::{ObjStore, Result, SyncError};
 
     #[test]
     fn empty_index_has_root_tree_node() {
@@ -739,6 +784,23 @@ mod tests {
                 .resolve_path(Path::new("missing.txt"))
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(index.materialize_all().unwrap().root, root);
+    }
+
+    #[tokio::test]
+    async fn hydrate_loads_nested_tree_from_obj_store() {
+        let (root, objects) = nested_objects();
+        let store = MemoryObjStore::from_objects(objects);
+
+        let index = TreeIndex::hydrate(root.clone(), &store).await.unwrap();
+
+        assert!(index.resolve_path(Path::new("docs")).unwrap().is_some());
+        assert!(
+            index
+                .resolve_path(Path::new("docs/guide.md"))
+                .unwrap()
+                .is_some()
         );
         assert_eq!(index.materialize_all().unwrap().root, root);
     }
@@ -908,5 +970,41 @@ mod tests {
 
     fn materialized_root(index: &TreeIndex) -> Tree {
         index.materialize_all().unwrap().root
+    }
+
+    struct MemoryObjStore {
+        objects: Mutex<BTreeMap<String, Object>>,
+    }
+
+    impl MemoryObjStore {
+        fn from_objects(objects: Vec<Object>) -> Self {
+            let mut map = BTreeMap::new();
+            for object in objects {
+                map.insert(format!("{:?}", object.id()), object);
+            }
+            Self {
+                objects: Mutex::new(map),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjStore for MemoryObjStore {
+        async fn load_object(&self, id: &ObjectId) -> Result<Object> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(&format!("{id:?}"))
+                .cloned()
+                .ok_or(SyncError::NotFound)
+        }
+
+        async fn save_object(&self, object: &Object) -> Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(format!("{:?}", object.id()), object.clone());
+            Ok(())
+        }
     }
 }

@@ -1240,11 +1240,8 @@ mod tests {
         std::fs::write(sync_root.join("hello.txt"), b"hello").unwrap();
 
         let (config, file, tree) = sample_config_and_tree(sync_root.clone());
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: [0; 32],
-            published_snapshot: [0; 32],
-            frontier: Frontier::default(),
-        }));
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
@@ -1296,11 +1293,10 @@ mod tests {
 
         let (config, file, tree) = sample_config_and_tree(sync_root);
         let snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: snapshot.hash,
-            published_snapshot: snapshot.hash,
-            frontier: Frontier::default(),
-        }));
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(test_device_state(
+            snapshot.hash,
+            snapshot.hash,
+        )));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(tree.clone()));
@@ -1341,11 +1337,8 @@ mod tests {
         std::fs::write(&file_path, b"hello").unwrap();
 
         let (config, file, tree) = sample_config_and_tree(sync_root.clone());
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: [0; 32],
-            published_snapshot: [0; 32],
-            frontier: Frontier::default(),
-        }));
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file.clone()));
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
@@ -1402,11 +1395,8 @@ mod tests {
         std::fs::write(sync_root.join("docs/guide.md"), b"guide").unwrap();
 
         let (config, file, docs_tree, root_tree) = sample_nested_config_and_tree(sync_root.clone());
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: [0; 32],
-            published_snapshot: [0; 32],
-            frontier: Frontier::default(),
-        }));
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(docs_tree));
@@ -1458,11 +1448,8 @@ mod tests {
         std::fs::write(&file_path, b"guide").unwrap();
 
         let (config, file, docs_tree, root_tree) = sample_nested_config_and_tree(sync_root.clone());
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: [0; 32],
-            published_snapshot: [0; 32],
-            frontier: Frontier::default(),
-        }));
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(docs_tree));
@@ -1527,11 +1514,8 @@ mod tests {
         std::fs::write(&from_path, b"guide").unwrap();
 
         let (config, file, docs_tree, root_tree) = sample_nested_config_and_tree(sync_root.clone());
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: [0; 32],
-            published_snapshot: [0; 32],
-            frontier: Frontier::default(),
-        }));
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(docs_tree));
@@ -1587,11 +1571,8 @@ mod tests {
         std::fs::create_dir_all(&sync_root).unwrap();
 
         let (config, _file, _tree) = sample_config_and_tree(sync_root.clone());
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: [0; 32],
-            published_snapshot: [0; 32],
-            frontier: Frontier::default(),
-        }));
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
@@ -1665,11 +1646,10 @@ mod tests {
         let tip_snapshot =
             build_snapshot(&"peer-b".to_string(), [5; 32], Some(&base_snapshot.hash));
         let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: [0; 32],
-            published_snapshot: [0; 32],
             frontier: Frontier {
                 device_snapshots: BTreeMap::from([("peer-a".into(), base_snapshot.hash)]),
             },
+            ..test_device_state([0; 32], [0; 32])
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::Snapshot(base_snapshot.clone()));
@@ -1744,11 +1724,10 @@ mod tests {
         );
 
         let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: base_snapshot.hash,
-            published_snapshot: base_snapshot.hash,
             frontier: Frontier {
                 device_snapshots: BTreeMap::from([("peer-1".into(), target_snapshot.hash)]),
             },
+            ..test_device_state(base_snapshot.hash, base_snapshot.hash)
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::Tree(tree.clone()));
@@ -1816,11 +1795,10 @@ mod tests {
         let remote_tip = build_snapshot(&"peer-1".to_string(), [5; 32], Some(&remote_base.hash));
 
         let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: local_snapshot.hash,
-            published_snapshot: local_snapshot.hash,
             frontier: Frontier {
                 device_snapshots: BTreeMap::from([("peer-1".into(), remote_tip.hash)]),
             },
+            ..test_device_state(local_snapshot.hash, local_snapshot.hash)
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::Tree(tree.clone()));
@@ -1898,11 +1876,10 @@ mod tests {
             TreeChange::File(docs_file.clone()),
         );
 
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: base_snapshot.hash,
-            published_snapshot: base_snapshot.hash,
-            frontier: Frontier::default(),
-        }));
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(test_device_state(
+            base_snapshot.hash,
+            base_snapshot.hash,
+        )));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::Tree(Tree::empty()));
         obj_store.insert(Object::Snapshot(base_snapshot.clone()));
@@ -1965,11 +1942,8 @@ mod tests {
         std::fs::create_dir_all(&sync_root).unwrap();
 
         let (config, _file, tree) = sample_config_and_tree(sync_root.clone());
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: [0; 32],
-            published_snapshot: [0; 32],
-            frontier: Frontier::default(),
-        }));
+        let meta_store =
+            std::sync::Arc::new(MemoryMetaStore::new(test_device_state([0; 32], [0; 32])));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         let blob_store = std::sync::Arc::new(MemoryBlobStore::new());
         let blob_worker = test_blob_worker(blob_store.clone());
@@ -2018,11 +1992,10 @@ mod tests {
 
         let (config, file, tree) = sample_config_and_tree(sync_root.clone());
         let local_snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: local_snapshot.hash,
-            published_snapshot: local_snapshot.hash,
-            frontier: Frontier::default(),
-        }));
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(test_device_state(
+            local_snapshot.hash,
+            local_snapshot.hash,
+        )));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(tree.clone()));
@@ -2093,8 +2066,6 @@ mod tests {
         let (config, file, tree) = sample_config_and_tree(sync_root.clone());
         let local_snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
         let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: local_snapshot.hash,
-            published_snapshot: local_snapshot.hash,
             frontier: Frontier {
                 device_snapshots: BTreeMap::from([
                     (config.device_id.clone(), local_snapshot.hash),
@@ -2103,6 +2074,7 @@ mod tests {
                     ("peer-c".into(), [0; 32]),
                 ]),
             },
+            ..test_device_state(local_snapshot.hash, local_snapshot.hash)
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file));
@@ -2145,14 +2117,13 @@ mod tests {
         let snapshot_a = build_snapshot(&"peer-a".to_string(), [2; 32], Some(&[0; 32]));
         let snapshot_b = build_snapshot(&"peer-b".to_string(), [3; 32], Some(&[0; 32]));
         let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: [0; 32],
-            published_snapshot: [0; 32],
             frontier: Frontier {
                 device_snapshots: BTreeMap::from([
                     ("peer-b".into(), snapshot_b.hash),
                     ("peer-a".into(), snapshot_a.hash),
                 ]),
             },
+            ..test_device_state([0; 32], [0; 32])
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::Snapshot(snapshot_a.clone()));
@@ -2195,14 +2166,13 @@ mod tests {
         let tip_snapshot =
             build_snapshot(&"peer-tip".to_string(), [3; 32], Some(&base_snapshot.hash));
         let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: [0; 32],
-            published_snapshot: [0; 32],
             frontier: Frontier {
                 device_snapshots: BTreeMap::from([
                     ("peer-a".into(), base_snapshot.hash),
                     ("peer-b".into(), tip_snapshot.hash),
                 ]),
             },
+            ..test_device_state([0; 32], [0; 32])
         }));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file));
@@ -2258,11 +2228,10 @@ mod tests {
 
         let (config, file, tree) = sample_config_and_tree(sync_root.clone());
         let snapshot = build_snapshot(&config.device_id, tree.hash, Some(&[0; 32]));
-        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(DeviceState {
-            snapshot: snapshot.hash,
-            published_snapshot: snapshot.hash,
-            frontier: Frontier::default(),
-        }));
+        let meta_store = std::sync::Arc::new(MemoryMetaStore::new(test_device_state(
+            snapshot.hash,
+            snapshot.hash,
+        )));
         let obj_store = std::sync::Arc::new(MemoryObjStore::new());
         obj_store.insert(Object::File(file));
         obj_store.insert(Object::Tree(tree.clone()));
@@ -2332,6 +2301,18 @@ mod tests {
         tree.update_hash();
 
         (config, file, tree)
+    }
+
+    fn test_device_state(snapshot: SnapshotHash, published_snapshot: SnapshotHash) -> DeviceState {
+        DeviceState {
+            snapshot,
+            published_snapshot,
+            local_snapshot: (snapshot != [0; 32]).then_some(snapshot),
+            applied_seqno: 0,
+            accepted_seqno: 0,
+            next_revision: 1,
+            frontier: Frontier::default(),
+        }
     }
 
     fn sample_nested_config_and_tree(sync_root: PathBuf) -> (Config, File, Tree, Tree) {

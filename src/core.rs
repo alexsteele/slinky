@@ -38,6 +38,10 @@ pub struct Config {
 pub struct DeviceState {
     pub snapshot: SnapshotHash,
     pub published_snapshot: SnapshotHash,
+    pub local_snapshot: Option<SnapshotHash>,
+    pub applied_seqno: SeqNo,
+    pub accepted_seqno: SeqNo,
+    pub next_revision: Revision,
     pub frontier: Frontier,
 }
 

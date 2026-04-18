@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::core::{
-    BlobHash, ChangeSet, Config, Delta, DeltaAnnouncement, DeltaWindow, DeviceId, DeviceState,
-    File, FileChange, FileOp, Object, ObjectId, PendingDelta, Revision, Snapshot,
-    SnapshotAnnouncement, SnapshotHash, Tree, TreeDiff,
+    BlobHash, ChangeSet, Config, Delta, DeltaWindow, DeviceId, DeviceState, File, FileChange,
+    FileOp, Object, ObjectId, PendingDelta, Revision, Snapshot, SnapshotAnnouncement, SnapshotHash,
+    Tree, TreeDiff,
 };
 use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
@@ -352,36 +352,39 @@ impl SyncEngine {
         Ok(())
     }
 
-    async fn handle_remote_delta(&mut self, announcement: DeltaAnnouncement) -> Result<()> {
-        if announcement.repo_id != self.config.repo_id {
-            self.log(&format!(
-                "ignoring remote delta for different repo: {}",
-                announcement.repo_id
-            ));
-            return Ok(());
-        }
-
-        if announcement.device == self.config.device_id {
+    async fn handle_remote_delta(&mut self, delta: Delta) -> Result<()> {
+        if delta.device_id == self.config.device_id {
             self.log("ignoring remote delta from local device");
             return Ok(());
         }
 
-        if announcement.seqno <= self.state.accepted_seqno {
+        if delta.seqno <= self.state.accepted_seqno {
             self.log(&format!(
                 "ignoring stale remote delta {} from {}",
-                announcement.seqno, announcement.device
+                delta.seqno, delta.device_id
             ));
             return Ok(());
         }
 
-        let Some(window) = Self::delta_window(self.state.accepted_seqno, announcement.seqno) else {
+        if delta.seqno == self.state.accepted_seqno + 1 {
+            self.apply_remote_deltas(&delta.device_id, std::slice::from_ref(&delta))?;
+            self.state.accepted_seqno = delta.seqno;
+            self.save_state().await?;
+            self.log(&format!(
+                "accepted contiguous remote delta {} from {}",
+                delta.seqno, delta.device_id
+            ));
+            return Ok(());
+        }
+
+        let Some(window) = Self::delta_window(self.state.accepted_seqno, delta.seqno) else {
             return Ok(());
         };
         let deltas = self
             .relay
             .fetch_delta_window(&self.config.repo_id, &window)
             .await?;
-        let fetched = self.validate_remote_deltas(&announcement.device, &window, &deltas)?;
+        let fetched = self.apply_remote_deltas(&delta.device_id, &deltas)?;
         if fetched == 0 {
             self.log("remote delta fetch returned no applicable deltas");
             return Ok(());
@@ -391,19 +394,14 @@ impl SyncEngine {
         self.save_state().await?;
         self.log(&format!(
             "fetched {} remote deltas from {} up to seqno {}",
-            fetched, announcement.device, window.to_inclusive
+            fetched, delta.device_id, window.to_inclusive
         ));
         Ok(())
     }
 
-    /// Validates one fetched relay delta window before replay/apply is implemented.
-    fn validate_remote_deltas(
-        &self,
-        device_id: &DeviceId,
-        window: &DeltaWindow,
-        deltas: &[Delta],
-    ) -> Result<usize> {
-        let mut expected = window.from_exclusive + 1;
+    /// Validates one remote delta batch before replay/apply is implemented.
+    fn apply_remote_deltas(&self, device_id: &DeviceId, deltas: &[Delta]) -> Result<usize> {
+        let mut expected = self.state.accepted_seqno + 1;
         for delta in deltas {
             if delta.device_id != *device_id {
                 return Err(crate::services::SyncError::InvalidState(
@@ -1072,9 +1070,9 @@ mod tests {
 
     use super::SyncEngine;
     use crate::core::{
-        ChangeSet, Config, Delta, DeltaAnnouncement, DeviceCredentials, DeviceState, File,
-        FileKind, Frontier, FullBlob, Object, ObjectHash, ObjectId, Snapshot,
-        SnapshotAnnouncement, SnapshotHash, Tree, TreeChange, TreeDiff, TreeEntry,
+        ChangeSet, Config, Delta, DeviceCredentials, DeviceState, File, FileKind, Frontier,
+        FullBlob, Object, ObjectHash, ObjectId, Snapshot, SnapshotAnnouncement, SnapshotHash, Tree,
+        TreeChange, TreeDiff, TreeEntry,
     };
     use crate::local::util::hash_bytes;
     use crate::local::{LocalApplier, LocalChunker, build_snapshot};
@@ -2265,13 +2263,9 @@ mod tests {
         .unwrap();
 
         engine
-            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(
-                DeltaAnnouncement {
-                    repo_id: config.repo_id.clone(),
-                    device: "peer-1".into(),
-                    seqno: 6,
-                },
-            )))
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(sample_delta(
+                "peer-1", 6,
+            ))))
             .await
             .unwrap();
 
@@ -2313,25 +2307,18 @@ mod tests {
         .unwrap();
 
         engine
-            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(
-                DeltaAnnouncement {
-                    repo_id: config.repo_id.clone(),
-                    device: config.device_id.clone(),
-                    seqno: 9,
-                },
-            )))
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(sample_delta(
+                &config.device_id,
+                9,
+            ))))
             .await
             .unwrap();
         assert_eq!(engine.state.accepted_seqno, 8);
 
         engine
-            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(
-                DeltaAnnouncement {
-                    repo_id: config.repo_id.clone(),
-                    device: "peer-1".into(),
-                    seqno: 8,
-                },
-            )))
+            .handle_event(super::SyncEvent::Remote(RelayEvent::Delta(sample_delta(
+                "peer-1", 8,
+            ))))
             .await
             .unwrap();
         assert_eq!(engine.state.accepted_seqno, 8);

@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::core::{
-    ChangeSet, Checkpoint, CheckpointAnnouncement, Config, Delta, DeltaAnnouncement, DeltaWindow,
-    DeviceId, Frontier, PeerState, RepoId, SeqNo, Snapshot, SnapshotAnnouncement, SnapshotHash,
+    ChangeSet, Checkpoint, CheckpointAnnouncement, Config, Delta, DeltaWindow, DeviceId, Frontier,
+    PeerState, RepoId, SeqNo, Snapshot, SnapshotAnnouncement, SnapshotHash,
 };
 use crate::services::{Result, SyncError};
 
@@ -115,7 +115,7 @@ pub trait Relay: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayEvent {
     Snapshot(SnapshotAnnouncement),
-    Delta(DeltaAnnouncement),
+    Delta(Delta),
     Checkpoint(CheckpointAnnouncement),
     PeerAvailable(PeerState),
 }

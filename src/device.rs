@@ -25,12 +25,30 @@ pub struct Device {
     pub service: SyncService,
 }
 
-impl Device {
-    pub async fn open(config: Config) -> Result<Self> {
-        Self::open_with_relay(config, Arc::new(NoopRelay)).await
-    }
+/// Optional dependency overrides for device assembly.
+pub struct DeviceOptions {
+    pub config: Config,
+    pub relay: Option<Arc<dyn Relay>>,
+    pub watcher: Option<Arc<dyn Watcher>>,
+}
 
-    pub async fn open_with_relay(config: Config, relay: Arc<dyn Relay>) -> Result<Self> {
+impl DeviceOptions {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            relay: None,
+            watcher: None,
+        }
+    }
+}
+
+impl Device {
+    pub async fn open(options: DeviceOptions) -> Result<Self> {
+        let DeviceOptions {
+            config,
+            relay,
+            watcher,
+        } = options;
         let meta_store = Self::open_meta_store(&config).await?;
         let blob_store = Self::open_blob_store(&config).await?;
         let blob_worker = Self::open_blob_worker(blob_store.clone()).await?;
@@ -38,7 +56,14 @@ impl Device {
         let obj_store = Self::open_obj_store(&config).await?;
         let chunker = Self::open_chunker().await?;
         let tree_builder = Self::open_tree_builder(chunker.clone()).await?;
-        let watcher = Self::open_watcher().await?;
+        let relay = match relay {
+            Some(relay) => relay,
+            None => Arc::new(NoopRelay),
+        };
+        let watcher = match watcher {
+            Some(watcher) => watcher,
+            None => Self::open_watcher().await?,
+        };
 
         let engine = SyncEngine::open(
             config.clone(),
@@ -60,7 +85,7 @@ impl Device {
 
     pub async fn open_path(config_path: &std::path::Path) -> Result<Self> {
         let config = load_config(config_path)?;
-        Self::open(config).await
+        Self::open(DeviceOptions::new(config)).await
     }
 
     pub async fn start(&mut self) -> Result<()> {
@@ -128,10 +153,11 @@ mod tests {
     use tempfile::tempdir;
     use tokio::time::{Duration, sleep};
 
-    use super::Device;
+    use super::{Device, DeviceOptions};
     use crate::core::{Config, DeviceCredentials, FileKind, Object, ObjectId};
-    use crate::local::{LocalMetaStore, MemoryRelay};
+    use crate::local::{LocalMetaStore, MemoryRelay, NoopWatcher};
     use crate::local::util::{device_root, encode_hash, hash_bytes};
+    use crate::services::WatcherEvent;
 
     #[tokio::test]
     async fn device_start_persists_snapshot_tree_and_blob() {
@@ -207,7 +233,7 @@ mod tests {
             },
         };
 
-        let mut device = Device::open(config).await.unwrap();
+        let mut device = Device::open(DeviceOptions::new(config)).await.unwrap();
         device.start().await.unwrap();
 
         std::fs::write(sync_root.join("hello.txt"), b"hello updated").unwrap();
@@ -249,7 +275,7 @@ mod tests {
             },
         };
 
-        let mut device = Device::open(config).await.unwrap();
+        let mut device = Device::open(DeviceOptions::new(config)).await.unwrap();
         device.start().await.unwrap();
 
         std::fs::remove_dir_all(sync_root.join("docs")).unwrap();
@@ -283,7 +309,7 @@ mod tests {
             },
         };
 
-        let mut device = Device::open(config).await.unwrap();
+        let mut device = Device::open(DeviceOptions::new(config)).await.unwrap();
         device.start().await.unwrap();
 
         std::fs::remove_file(sync_root.join("docs/guide.md")).unwrap();
@@ -330,7 +356,7 @@ mod tests {
             },
         };
 
-        let mut device = Device::open(config).await.unwrap();
+        let mut device = Device::open(DeviceOptions::new(config)).await.unwrap();
         device.start().await.unwrap();
 
         let meta_store = LocalMetaStore::open(device.config.clone()).unwrap();
@@ -385,7 +411,7 @@ mod tests {
             },
         };
 
-        let mut device = Device::open(config).await.unwrap();
+        let mut device = Device::open(DeviceOptions::new(config)).await.unwrap();
         device.start().await.unwrap();
 
         std::fs::create_dir_all(sync_root.join("guides")).unwrap();
@@ -428,7 +454,7 @@ mod tests {
             },
         };
 
-        let mut device = Device::open(config).await.unwrap();
+        let mut device = Device::open(DeviceOptions::new(config)).await.unwrap();
         device.start().await.unwrap();
 
         std::fs::create_dir_all(sync_root.join("docs")).unwrap();
@@ -490,13 +516,35 @@ mod tests {
             },
         };
 
-        let mut device_a = Device::open_with_relay(config_a, relay.clone()).await.unwrap();
-        let mut device_b = Device::open_with_relay(config_b, relay).await.unwrap();
+        let mut device_a = Device::open_with_options(
+            config_a,
+            DeviceOptions {
+                relay: Some(relay.clone()),
+                watcher: Some(std::sync::Arc::new(NoopWatcher)),
+            },
+        )
+        .await
+        .unwrap();
+        let mut device_b = Device::open_with_options(
+            config_b,
+            DeviceOptions {
+                relay: Some(relay),
+                watcher: Some(std::sync::Arc::new(NoopWatcher)),
+            },
+        )
+        .await
+        .unwrap();
 
         device_a.start().await.unwrap();
         device_b.start().await.unwrap();
 
-        std::fs::write(sync_root_a.join("hello.txt"), b"hello relay").unwrap();
+        let source_path = sync_root_a.join("hello.txt");
+        std::fs::write(&source_path, b"hello relay").unwrap();
+        device_a
+            .service
+            .send_local_event(WatcherEvent::FileChanged(source_path.clone()))
+            .await
+            .unwrap();
 
         let target_path = sync_root_b.join("hello.txt");
         let mut synced = false;
@@ -522,6 +570,210 @@ mod tests {
             engine_b
                 .index
                 .resolve_path(Path::new("hello.txt"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn two_devices_sync_file_delete_through_memory_relay() {
+        let dir = tempdir().unwrap();
+        let relay = MemoryRelay::new();
+        let repo_id = format!(
+            "repo-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let sync_root_a = dir.path().join("sync-a");
+        let sync_root_b = dir.path().join("sync-b");
+        std::fs::create_dir_all(&sync_root_a).unwrap();
+        std::fs::create_dir_all(&sync_root_b).unwrap();
+        std::fs::write(sync_root_a.join("delete-me.txt"), b"bye").unwrap();
+        std::fs::write(sync_root_b.join("delete-me.txt"), b"bye").unwrap();
+
+        let config_a = Config {
+            sync_root: sync_root_a.clone(),
+            repo_id: repo_id.clone(),
+            device_id: "device-a".into(),
+            credentials: DeviceCredentials {
+                public_key: "pub-a".into(),
+                private_key_path: dir.path().join("device-a.key"),
+            },
+        };
+        let config_b = Config {
+            sync_root: sync_root_b.clone(),
+            repo_id,
+            device_id: "device-b".into(),
+            credentials: DeviceCredentials {
+                public_key: "pub-b".into(),
+                private_key_path: dir.path().join("device-b.key"),
+            },
+        };
+
+        let mut device_a = Device::open_with_options(
+            config_a,
+            DeviceOptions {
+                relay: Some(relay.clone()),
+                watcher: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut device_b = Device::open_with_options(
+            config_b,
+            DeviceOptions {
+                relay: Some(relay),
+                watcher: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        device_a.start().await.unwrap();
+        device_b.start().await.unwrap();
+
+        let target_path_b = sync_root_b.join("delete-me.txt");
+        let source_path_a = sync_root_a.join("delete-me.txt");
+
+        std::fs::remove_file(&source_path_a).unwrap();
+        device_a
+            .service
+            .send_local_event(WatcherEvent::FileDeleted(source_path_a.clone()))
+            .await
+            .unwrap();
+
+        let mut deleted = false;
+        for _ in 0..20 {
+            sleep(Duration::from_millis(100)).await;
+            if !target_path_b.exists() {
+                deleted = true;
+                break;
+            }
+        }
+
+        device_a.stop().await.unwrap();
+        device_b.stop().await.unwrap();
+        device_a.join().await.unwrap();
+        device_b.join().await.unwrap();
+
+        assert!(deleted, "device B did not remove the file after device A deleted it");
+        let engine_b = device_b.service.engine.as_ref().unwrap();
+        assert!(
+            engine_b
+                .index
+                .resolve_path(Path::new("delete-me.txt"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn two_devices_sync_file_move_through_memory_relay() {
+        let dir = tempdir().unwrap();
+        let relay = MemoryRelay::new();
+        let repo_id = format!(
+            "repo-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let sync_root_a = dir.path().join("sync-a");
+        let sync_root_b = dir.path().join("sync-b");
+        std::fs::create_dir_all(sync_root_a.join("docs")).unwrap();
+        std::fs::create_dir_all(sync_root_b.join("docs")).unwrap();
+        std::fs::write(sync_root_a.join("docs/guide.md"), b"move me").unwrap();
+        std::fs::write(sync_root_b.join("docs/guide.md"), b"move me").unwrap();
+
+        let config_a = Config {
+            sync_root: sync_root_a.clone(),
+            repo_id: repo_id.clone(),
+            device_id: "device-a".into(),
+            credentials: DeviceCredentials {
+                public_key: "pub-a".into(),
+                private_key_path: dir.path().join("device-a.key"),
+            },
+        };
+        let config_b = Config {
+            sync_root: sync_root_b.clone(),
+            repo_id,
+            device_id: "device-b".into(),
+            credentials: DeviceCredentials {
+                public_key: "pub-b".into(),
+                private_key_path: dir.path().join("device-b.key"),
+            },
+        };
+
+        let mut device_a = Device::open_with_options(
+            config_a,
+            DeviceOptions {
+                relay: Some(relay.clone()),
+                watcher: Some(std::sync::Arc::new(NoopWatcher)),
+            },
+        )
+        .await
+        .unwrap();
+        let mut device_b = Device::open_with_options(
+            config_b,
+            DeviceOptions {
+                relay: Some(relay),
+                watcher: Some(std::sync::Arc::new(NoopWatcher)),
+            },
+        )
+        .await
+        .unwrap();
+
+        device_a.start().await.unwrap();
+        device_b.start().await.unwrap();
+
+        let from_a = sync_root_a.join("docs/guide.md");
+        let from_b = sync_root_b.join("docs/guide.md");
+        let to_a = sync_root_a.join("guides/guide.md");
+        let to_b = sync_root_b.join("guides/guide.md");
+
+        std::fs::create_dir_all(to_a.parent().unwrap()).unwrap();
+        std::fs::rename(&from_a, &to_a).unwrap();
+        device_a
+            .service
+            .send_local_event(WatcherEvent::PathMoved {
+                from: from_a.clone(),
+                to: to_a.clone(),
+            })
+            .await
+            .unwrap();
+
+        let mut moved = false;
+        for _ in 0..20 {
+            sleep(Duration::from_millis(100)).await;
+            if !from_b.exists()
+                && to_b.exists()
+                && std::fs::read_to_string(&to_b).unwrap_or_default() == "move me"
+            {
+                moved = true;
+                break;
+            }
+        }
+
+        device_a.stop().await.unwrap();
+        device_b.stop().await.unwrap();
+        device_a.join().await.unwrap();
+        device_b.join().await.unwrap();
+
+        assert!(moved, "device B did not move the file after device A renamed it");
+        let engine_b = device_b.service.engine.as_ref().unwrap();
+        assert!(
+            engine_b
+                .index
+                .resolve_path(Path::new("docs/guide.md"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine_b
+                .index
+                .resolve_path(Path::new("guides/guide.md"))
                 .unwrap()
                 .is_some()
         );

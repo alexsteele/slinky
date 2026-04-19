@@ -18,6 +18,7 @@ pub struct SyncService {
     pub watcher: Arc<dyn Watcher>,
     pub sync_root: PathBuf,
     started: bool,
+    event_tx: Option<mpsc::Sender<SyncEvent>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     watcher_shutdown_tx: Option<oneshot::Sender<()>>,
     relay_shutdown_tx: Option<oneshot::Sender<()>>,
@@ -33,6 +34,7 @@ impl SyncService {
             watcher,
             sync_root,
             started: false,
+            event_tx: None,
             shutdown_tx: None,
             watcher_shutdown_tx: None,
             relay_shutdown_tx: None,
@@ -57,6 +59,7 @@ impl SyncService {
         engine.start().await?;
 
         let (event_tx, mut event_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+        self.event_tx = Some(event_tx.clone());
         let watcher = self.watcher.clone();
         let sync_root = self.sync_root.clone();
         let relay = engine.relay.clone();
@@ -164,6 +167,7 @@ impl SyncService {
         if let Some(relay_shutdown_tx) = self.relay_shutdown_tx.take() {
             let _ = relay_shutdown_tx.send(());
         }
+        self.event_tx = None;
         Ok(())
     }
 
@@ -213,6 +217,14 @@ impl SyncService {
 
     #[cfg(test)]
     pub async fn send_local_event(&mut self, event: crate::services::WatcherEvent) -> Result<()> {
+        if let Some(event_tx) = &self.event_tx {
+            event_tx
+                .send(SyncEvent::Local(event))
+                .await
+                .map_err(|_| SyncError::InvalidState("event channel is closed".into()))?;
+            return Ok(());
+        }
+
         let engine = self
             .engine
             .as_mut()

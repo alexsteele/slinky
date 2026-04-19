@@ -18,7 +18,7 @@ pub use config::load_config;
 pub use meta_store::LocalMetaStore;
 pub use obj_store::LocalObjStore;
 pub use reconciler::NoopReconciler;
-pub use relay::NoopRelay;
+pub use relay::{MemoryRelay, NoopRelay};
 pub use scanner::FsScanner;
 pub use snapshot::build_snapshot;
 pub use tree::LocalTreeBuilder;

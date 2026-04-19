@@ -27,12 +27,15 @@ pub struct Device {
 
 impl Device {
     pub async fn open(config: Config) -> Result<Self> {
+        Self::open_with_relay(config, Arc::new(NoopRelay)).await
+    }
+
+    pub async fn open_with_relay(config: Config, relay: Arc<dyn Relay>) -> Result<Self> {
         let meta_store = Self::open_meta_store(&config).await?;
         let blob_store = Self::open_blob_store(&config).await?;
         let blob_worker = Self::open_blob_worker(blob_store.clone()).await?;
         let applier = Self::open_applier(&config, blob_store.clone()).await?;
         let obj_store = Self::open_obj_store(&config).await?;
-        let relay = Self::connect_relay(&config).await?;
         let chunker = Self::open_chunker().await?;
         let tree_builder = Self::open_tree_builder(chunker.clone()).await?;
         let watcher = Self::open_watcher().await?;
@@ -88,10 +91,6 @@ impl Device {
         LocalBlobStore::open(_config)
     }
 
-    async fn connect_relay(_config: &Config) -> Result<Arc<dyn Relay>> {
-        Ok(Arc::new(NoopRelay))
-    }
-
     async fn open_blob_worker(
         blob_store: Arc<dyn BlobStore>,
     ) -> Result<Arc<dyn BlobTransferWorker>> {
@@ -123,6 +122,7 @@ impl Device {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::tempdir;
@@ -130,7 +130,7 @@ mod tests {
 
     use super::Device;
     use crate::core::{Config, DeviceCredentials, FileKind, Object, ObjectId};
-    use crate::local::LocalMetaStore;
+    use crate::local::{LocalMetaStore, MemoryRelay};
     use crate::local::util::{device_root, encode_hash, hash_bytes};
 
     #[tokio::test]
@@ -453,5 +453,77 @@ mod tests {
             .resolve_path(std::path::Path::new("docs/guide.md"))
             .unwrap();
         assert!(guide_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn two_devices_sync_file_change_through_memory_relay() {
+        let dir = tempdir().unwrap();
+        let relay = MemoryRelay::new();
+        let repo_id = format!(
+            "repo-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let sync_root_a = dir.path().join("sync-a");
+        let sync_root_b = dir.path().join("sync-b");
+        std::fs::create_dir_all(&sync_root_a).unwrap();
+        std::fs::create_dir_all(&sync_root_b).unwrap();
+
+        let config_a = Config {
+            sync_root: sync_root_a.clone(),
+            repo_id: repo_id.clone(),
+            device_id: "device-a".into(),
+            credentials: DeviceCredentials {
+                public_key: "pub-a".into(),
+                private_key_path: dir.path().join("device-a.key"),
+            },
+        };
+        let config_b = Config {
+            sync_root: sync_root_b.clone(),
+            repo_id,
+            device_id: "device-b".into(),
+            credentials: DeviceCredentials {
+                public_key: "pub-b".into(),
+                private_key_path: dir.path().join("device-b.key"),
+            },
+        };
+
+        let mut device_a = Device::open_with_relay(config_a, relay.clone()).await.unwrap();
+        let mut device_b = Device::open_with_relay(config_b, relay).await.unwrap();
+
+        device_a.start().await.unwrap();
+        device_b.start().await.unwrap();
+
+        std::fs::write(sync_root_a.join("hello.txt"), b"hello relay").unwrap();
+
+        let target_path = sync_root_b.join("hello.txt");
+        let mut synced = false;
+        for _ in 0..20 {
+            sleep(Duration::from_millis(100)).await;
+            if target_path.exists()
+                && std::fs::read_to_string(&target_path).unwrap_or_default() == "hello relay"
+            {
+                synced = true;
+                break;
+            }
+        }
+
+        device_a.stop().await.unwrap();
+        device_b.stop().await.unwrap();
+        device_a.join().await.unwrap();
+        device_b.join().await.unwrap();
+
+        assert!(synced, "device B did not receive the file update from device A");
+        assert_eq!(std::fs::read_to_string(&target_path).unwrap(), "hello relay");
+        let engine_b = device_b.service.engine.as_ref().unwrap();
+        assert!(
+            engine_b
+                .index
+                .resolve_path(Path::new("hello.txt"))
+                .unwrap()
+                .is_some()
+        );
     }
 }

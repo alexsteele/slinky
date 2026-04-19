@@ -14,7 +14,7 @@ use crate::core::{Blob, FullBlob};
 use crate::local::util::hash_bytes;
 use crate::services::{Chunk, ChunkReader, Chunker, Result};
 
-const DEFAULT_CHUNK_SIZE: usize = 256 * 1024;
+const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// Chunks local files into fixed-size blobs.
 pub struct LocalChunker {

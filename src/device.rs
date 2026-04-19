@@ -181,7 +181,9 @@ mod tests {
             },
         };
 
-        let mut device = Device::open(config.clone()).await.unwrap();
+        let mut device = Device::open(DeviceOptions::new(config.clone()))
+            .await
+            .unwrap();
         device.start().await.unwrap();
         device.stop().await.unwrap();
         device.join().await.unwrap();
@@ -516,18 +518,18 @@ mod tests {
             },
         };
 
-        let mut device_a = Device::open_with_options(
-            config_a,
+        let mut device_a = Device::open(
             DeviceOptions {
+                config: config_a,
                 relay: Some(relay.clone()),
                 watcher: Some(std::sync::Arc::new(NoopWatcher)),
             },
         )
         .await
         .unwrap();
-        let mut device_b = Device::open_with_options(
-            config_b,
+        let mut device_b = Device::open(
             DeviceOptions {
+                config: config_b,
                 relay: Some(relay),
                 watcher: Some(std::sync::Arc::new(NoopWatcher)),
             },
@@ -612,18 +614,18 @@ mod tests {
             },
         };
 
-        let mut device_a = Device::open_with_options(
-            config_a,
+        let mut device_a = Device::open(
             DeviceOptions {
+                config: config_a,
                 relay: Some(relay.clone()),
                 watcher: None,
             },
         )
         .await
         .unwrap();
-        let mut device_b = Device::open_with_options(
-            config_b,
+        let mut device_b = Device::open(
             DeviceOptions {
+                config: config_b,
                 relay: Some(relay),
                 watcher: None,
             },
@@ -706,18 +708,18 @@ mod tests {
             },
         };
 
-        let mut device_a = Device::open_with_options(
-            config_a,
+        let mut device_a = Device::open(
             DeviceOptions {
+                config: config_a,
                 relay: Some(relay.clone()),
                 watcher: Some(std::sync::Arc::new(NoopWatcher)),
             },
         )
         .await
         .unwrap();
-        let mut device_b = Device::open_with_options(
-            config_b,
+        let mut device_b = Device::open(
             DeviceOptions {
+                config: config_b,
                 relay: Some(relay),
                 watcher: Some(std::sync::Arc::new(NoopWatcher)),
             },

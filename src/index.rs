@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use crate::core::{File, FileHash, FileKind, Object, ObjectHash, ObjectId, Tree, TreeEntry, TreeHash};
+use crate::core::{File, FileKind, Object, ObjectHash, ObjectId, Tree, TreeEntry, TreeHash};
 use crate::services::{ObjStore, Result, SyncError};
 
 pub type NodeId = u64;
@@ -89,21 +89,6 @@ impl TreeIndex {
             next_id: root + 1,
             nodes,
         }
-    }
-
-    /// Build an index from a persisted root tree.
-    pub fn load_from_root<LoadTree, LoadFile>(
-        root: Tree,
-        load_tree: &mut LoadTree,
-        load_file: &mut LoadFile,
-    ) -> Result<Self>
-    where
-        LoadTree: FnMut(TreeHash) -> Result<Tree>,
-        LoadFile: FnMut(FileHash) -> Result<File>,
-    {
-        let mut index = Self::empty();
-        index.load_tree_node(index.root, root, load_tree, load_file)?;
-        Ok(index)
     }
 
     /// Hydrate an index from one persisted root tree and the object store behind it.
@@ -354,54 +339,6 @@ impl TreeIndex {
             files,
             deleted_paths: Vec::new(),
         })
-    }
-
-    fn load_tree_node<LoadTree, LoadFile>(
-        &mut self,
-        node_id: NodeId,
-        tree: Tree,
-        load_tree: &mut LoadTree,
-        load_file: &mut LoadFile,
-    ) -> Result<()>
-    where
-        LoadTree: FnMut(TreeHash) -> Result<Tree>,
-        LoadFile: FnMut(FileHash) -> Result<File>,
-    {
-        let mut children = BTreeMap::new();
-
-        for entry in tree.entries {
-            match entry.hash {
-                ObjectHash::Tree(hash) => {
-                    let child_id = self.alloc_node(Node {
-                        parent: Some(node_id),
-                        name: entry.name.clone(),
-                        kind: NodeKind::Tree {
-                            hash,
-                            children: BTreeMap::new(),
-                        },
-                    });
-                    children.insert(entry.name.clone(), child_id);
-                    let child_tree = load_tree(hash)?;
-                    self.load_tree_node(child_id, child_tree, load_tree, load_file)?;
-                }
-                ObjectHash::File(hash) => {
-                    let file = load_file(hash)?;
-                    let child_id = self.alloc_node(Node {
-                        parent: Some(node_id),
-                        name: entry.name.clone(),
-                        kind: NodeKind::File { file },
-                    });
-                    children.insert(entry.name, child_id);
-                }
-            }
-        }
-
-        let node = self.node_mut(node_id)?;
-        node.kind = NodeKind::Tree {
-            hash: tree.hash,
-            children,
-        };
-        Ok(())
     }
 
     fn ensure_tree_path(&mut self, components: &[String]) -> Result<NodeId> {
@@ -717,7 +654,7 @@ mod tests {
 
     use super::{NodeKind, TreeIndex, TreeUpdate};
     use crate::core::{
-        File, FileHash, FileKind, Object, ObjectHash, ObjectId, Tree, TreeEntry, TreeHash,
+        File, FileKind, Object, ObjectHash, ObjectId, Tree, TreeEntry,
     };
     use crate::services::{ObjStore, Result, SyncError};
 
@@ -763,13 +700,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn loads_nested_tree_and_resolves_paths() {
+    #[tokio::test]
+    async fn loads_nested_tree_and_resolves_paths() {
         let (root, objects) = nested_objects();
-        let mut load_tree = |hash| load_tree_object(&objects, hash);
-        let mut load_file = |hash| load_file_object(&objects, hash);
-        let index =
-            TreeIndex::load_from_root(root.clone(), &mut load_tree, &mut load_file).unwrap();
+        let store = MemoryObjStore::from_objects(objects);
+        let index = TreeIndex::hydrate(root.clone(), &store).await.unwrap();
 
         assert_eq!(index.resolve_path(Path::new("")).unwrap(), Some(index.root));
         assert!(index.resolve_path(Path::new("docs")).unwrap().is_some());
@@ -859,12 +794,11 @@ mod tests {
         assert_eq!(update.root, materialized_root(&index));
     }
 
-    #[test]
-    fn remove_path_prunes_empty_directories() {
+    #[tokio::test]
+    async fn remove_path_prunes_empty_directories() {
         let (root, objects) = nested_objects();
-        let mut load_tree = |hash| load_tree_object(&objects, hash);
-        let mut load_file = |hash| load_file_object(&objects, hash);
-        let mut index = TreeIndex::load_from_root(root, &mut load_tree, &mut load_file).unwrap();
+        let store = MemoryObjStore::from_objects(objects);
+        let mut index = TreeIndex::hydrate(root, &store).await.unwrap();
 
         let update = index.remove_path(Path::new("docs/guide.md")).unwrap();
 
@@ -881,12 +815,11 @@ mod tests {
         assert_eq!(update.trees, vec![Tree::empty()]);
     }
 
-    #[test]
-    fn move_path_updates_descendant_file_paths() {
+    #[tokio::test]
+    async fn move_path_updates_descendant_file_paths() {
         let (root, objects) = nested_objects();
-        let mut load_tree = |hash| load_tree_object(&objects, hash);
-        let mut load_file = |hash| load_file_object(&objects, hash);
-        let mut index = TreeIndex::load_from_root(root, &mut load_tree, &mut load_file).unwrap();
+        let store = MemoryObjStore::from_objects(objects);
+        let mut index = TreeIndex::hydrate(root, &store).await.unwrap();
 
         let update = index
             .move_path(Path::new("docs"), Path::new("guides"))
@@ -944,28 +877,6 @@ mod tests {
         };
         file.update_hash();
         file
-    }
-
-    fn load_tree_object(objects: &[Object], hash: TreeHash) -> Result<Tree> {
-        for object in objects {
-            if let Object::Tree(tree) = object {
-                if tree.hash == hash {
-                    return Ok(tree.clone());
-                }
-            }
-        }
-        Err(SyncError::NotFound)
-    }
-
-    fn load_file_object(objects: &[Object], hash: FileHash) -> Result<File> {
-        for object in objects {
-            if let Object::File(file) = object {
-                if file.hash == hash {
-                    return Ok(file.clone());
-                }
-            }
-        }
-        Err(SyncError::NotFound)
     }
 
     fn materialized_root(index: &TreeIndex) -> Tree {

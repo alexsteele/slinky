@@ -11,8 +11,8 @@ use std::time::SystemTime;
 
 use crate::core::{
     BlobHash, ChangeSet, Config, Delta, DeltaWindow, DeviceId, DeviceState, File, FileChange,
-    FileOp, Object, ObjectId, PendingDelta, Revision, Snapshot, SnapshotAnnouncement,
-    SnapshotHash, Tree, TreeDiff,
+    FileOp, Object, ObjectId, PendingDelta, Revision, Snapshot, SnapshotAnnouncement, SnapshotHash,
+    Tree, TreeDiff,
 };
 use crate::index::{TreeIndex, TreeUpdate};
 use crate::local::build_snapshot;
@@ -78,89 +78,6 @@ pub enum SyncEvent {
 }
 
 impl SyncEngine {
-    /// Returns the replay window needed to advance from one applied seqno to a newer head.
-    pub fn delta_window(
-        from_exclusive: crate::core::SeqNo,
-        to_inclusive: crate::core::SeqNo,
-    ) -> Option<DeltaWindow> {
-        if to_inclusive <= from_exclusive {
-            return None;
-        }
-
-        Some(DeltaWindow {
-            from_exclusive,
-            to_inclusive,
-        })
-    }
-
-    /// Fetches the relay head and derives the replay window after one applied seqno.
-    pub async fn delta_window_to_head(
-        &self,
-        applied_seqno: crate::core::SeqNo,
-    ) -> Result<Option<DeltaWindow>> {
-        let head_seqno = self.relay.fetch_head_seqno(&self.config.repo_id).await?;
-        Ok(Self::delta_window(applied_seqno, head_seqno))
-    }
-
-    /// Returns the known remote tips that differ from the current local snapshot.
-    fn candidate_remote_tip_set(&self) -> Vec<(DeviceId, SnapshotHash)> {
-        let mut tips = Vec::new();
-        for (device_id, snapshot) in &self.state.frontier.device_snapshots {
-            if device_id == &self.config.device_id {
-                continue;
-            }
-            if *snapshot == [0; 32] || *snapshot == self.state.snapshot {
-                continue;
-            }
-            tips.push((device_id.clone(), *snapshot));
-        }
-        tips.sort();
-        tips
-    }
-
-    /// Returns the maximal remote frontier tips after pruning tips that are behind others.
-    pub async fn candidate_remote_tips(&self) -> Result<Vec<(DeviceId, SnapshotHash)>> {
-        let tips = self.candidate_remote_tip_set();
-        let mut maximal = Vec::new();
-
-        for (device_id, snapshot) in &tips {
-            let mut dominated = false;
-            for (_, other_snapshot) in &tips {
-                if snapshot == other_snapshot {
-                    continue;
-                }
-                if self
-                    .is_snapshot_ancestor(*snapshot, *other_snapshot)
-                    .await?
-                {
-                    dominated = true;
-                    break;
-                }
-            }
-
-            if !dominated {
-                maximal.push((device_id.clone(), *snapshot));
-            }
-        }
-
-        maximal.sort();
-        Ok(maximal)
-    }
-
-    /// Picks the next maximal remote frontier tip to reconcile toward.
-    pub async fn next_remote_target(&self) -> Result<Option<(DeviceId, SnapshotHash)>> {
-        Ok(self.candidate_remote_tips().await?.into_iter().next())
-    }
-
-    /// Builds a basic fast-forward apply plan for the next selected remote target.
-    pub async fn reconcile_next_remote_target(&self) -> Result<Option<ApplyPlan>> {
-        let Some((device_id, target)) = self.next_remote_target().await? else {
-            return Ok(None);
-        };
-
-        self.plan_remote_reconcile(&device_id, target).await
-    }
-
     pub async fn open(
         config: Config,
         meta_store: Arc<dyn MetaStore>,
@@ -247,6 +164,89 @@ impl SyncEngine {
                 Ok(None)
             }
         }
+    }
+
+    /// Returns the replay window needed to advance from one applied seqno to a newer head.
+    pub fn delta_window(
+        from_exclusive: crate::core::SeqNo,
+        to_inclusive: crate::core::SeqNo,
+    ) -> Option<DeltaWindow> {
+        if to_inclusive <= from_exclusive {
+            return None;
+        }
+
+        Some(DeltaWindow {
+            from_exclusive,
+            to_inclusive,
+        })
+    }
+
+    /// Fetches the relay head and derives the replay window after one applied seqno.
+    pub async fn delta_window_to_head(
+        &self,
+        applied_seqno: crate::core::SeqNo,
+    ) -> Result<Option<DeltaWindow>> {
+        let head_seqno = self.relay.fetch_head_seqno(&self.config.repo_id).await?;
+        Ok(Self::delta_window(applied_seqno, head_seqno))
+    }
+
+    /// Returns the known remote tips that differ from the current local snapshot.
+    fn candidate_remote_tip_set(&self) -> Vec<(DeviceId, SnapshotHash)> {
+        let mut tips = Vec::new();
+        for (device_id, snapshot) in &self.state.frontier.device_snapshots {
+            if device_id == &self.config.device_id {
+                continue;
+            }
+            if *snapshot == [0; 32] || *snapshot == self.state.snapshot {
+                continue;
+            }
+            tips.push((device_id.clone(), *snapshot));
+        }
+        tips.sort();
+        tips
+    }
+
+    /// Returns the maximal remote frontier tips after pruning tips that are behind others.
+    pub async fn candidate_remote_tips(&self) -> Result<Vec<(DeviceId, SnapshotHash)>> {
+        let tips = self.candidate_remote_tip_set();
+        let mut maximal = Vec::new();
+
+        for (device_id, snapshot) in &tips {
+            let mut dominated = false;
+            for (_, other_snapshot) in &tips {
+                if snapshot == other_snapshot {
+                    continue;
+                }
+                if self
+                    .is_snapshot_ancestor(*snapshot, *other_snapshot)
+                    .await?
+                {
+                    dominated = true;
+                    break;
+                }
+            }
+
+            if !dominated {
+                maximal.push((device_id.clone(), *snapshot));
+            }
+        }
+
+        maximal.sort();
+        Ok(maximal)
+    }
+
+    /// Picks the next maximal remote frontier tip to reconcile toward.
+    pub async fn next_remote_target(&self) -> Result<Option<(DeviceId, SnapshotHash)>> {
+        Ok(self.candidate_remote_tips().await?.into_iter().next())
+    }
+
+    /// Builds a basic fast-forward apply plan for the next selected remote target.
+    pub async fn reconcile_next_remote_target(&self) -> Result<Option<ApplyPlan>> {
+        let Some((device_id, target)) = self.next_remote_target().await? else {
+            return Ok(None);
+        };
+
+        self.plan_remote_reconcile(&device_id, target).await
     }
 
     async fn handle_remote_notification(&mut self, notification: RelayEvent) -> Result<()> {
@@ -827,9 +827,7 @@ impl SyncEngine {
                 let update = match change {
                     FileOp::CreateDir { path } => index.ensure_directory(Path::new(path))?,
                     FileOp::Remove { path } => index.remove_path(Path::new(path))?,
-                    FileOp::Move { from, to } => {
-                        index.move_path(Path::new(from), Path::new(to))?
-                    }
+                    FileOp::Move { from, to } => index.move_path(Path::new(from), Path::new(to))?,
                     FileOp::Modify(change) => {
                         index.upsert_file(Path::new(&change.path), change.file.clone())?
                     }

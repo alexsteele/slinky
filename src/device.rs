@@ -155,8 +155,8 @@ mod tests {
 
     use super::{Device, DeviceOptions};
     use crate::core::{Config, DeviceCredentials, FileKind, Object, ObjectId};
-    use crate::local::{LocalMetaStore, MemoryRelay, NoopWatcher};
     use crate::local::util::{device_root, encode_hash, hash_bytes};
+    use crate::local::{LocalMetaStore, MemoryRelay, NoopWatcher};
     use crate::services::WatcherEvent;
 
     #[tokio::test]
@@ -518,22 +518,18 @@ mod tests {
             },
         };
 
-        let mut device_a = Device::open(
-            DeviceOptions {
-                config: config_a,
-                relay: Some(relay.clone()),
-                watcher: Some(std::sync::Arc::new(NoopWatcher)),
-            },
-        )
+        let mut device_a = Device::open(DeviceOptions {
+            config: config_a,
+            relay: Some(relay.clone()),
+            watcher: Some(std::sync::Arc::new(NoopWatcher)),
+        })
         .await
         .unwrap();
-        let mut device_b = Device::open(
-            DeviceOptions {
-                config: config_b,
-                relay: Some(relay),
-                watcher: Some(std::sync::Arc::new(NoopWatcher)),
-            },
-        )
+        let mut device_b = Device::open(DeviceOptions {
+            config: config_b,
+            relay: Some(relay),
+            watcher: Some(std::sync::Arc::new(NoopWatcher)),
+        })
         .await
         .unwrap();
 
@@ -565,8 +561,14 @@ mod tests {
         device_a.join().await.unwrap();
         device_b.join().await.unwrap();
 
-        assert!(synced, "device B did not receive the file update from device A");
-        assert_eq!(std::fs::read_to_string(&target_path).unwrap(), "hello relay");
+        assert!(
+            synced,
+            "device B did not receive the file update from device A"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target_path).unwrap(),
+            "hello relay"
+        );
         let engine_b = device_b.service.engine.as_ref().unwrap();
         assert!(
             engine_b
@@ -614,22 +616,18 @@ mod tests {
             },
         };
 
-        let mut device_a = Device::open(
-            DeviceOptions {
-                config: config_a,
-                relay: Some(relay.clone()),
-                watcher: None,
-            },
-        )
+        let mut device_a = Device::open(DeviceOptions {
+            config: config_a,
+            relay: Some(relay.clone()),
+            watcher: None,
+        })
         .await
         .unwrap();
-        let mut device_b = Device::open(
-            DeviceOptions {
-                config: config_b,
-                relay: Some(relay),
-                watcher: None,
-            },
-        )
+        let mut device_b = Device::open(DeviceOptions {
+            config: config_b,
+            relay: Some(relay),
+            watcher: None,
+        })
         .await
         .unwrap();
 
@@ -660,7 +658,10 @@ mod tests {
         device_a.join().await.unwrap();
         device_b.join().await.unwrap();
 
-        assert!(deleted, "device B did not remove the file after device A deleted it");
+        assert!(
+            deleted,
+            "device B did not remove the file after device A deleted it"
+        );
         let engine_b = device_b.service.engine.as_ref().unwrap();
         assert!(
             engine_b
@@ -708,22 +709,18 @@ mod tests {
             },
         };
 
-        let mut device_a = Device::open(
-            DeviceOptions {
-                config: config_a,
-                relay: Some(relay.clone()),
-                watcher: Some(std::sync::Arc::new(NoopWatcher)),
-            },
-        )
+        let mut device_a = Device::open(DeviceOptions {
+            config: config_a,
+            relay: Some(relay.clone()),
+            watcher: Some(std::sync::Arc::new(NoopWatcher)),
+        })
         .await
         .unwrap();
-        let mut device_b = Device::open(
-            DeviceOptions {
-                config: config_b,
-                relay: Some(relay),
-                watcher: Some(std::sync::Arc::new(NoopWatcher)),
-            },
-        )
+        let mut device_b = Device::open(DeviceOptions {
+            config: config_b,
+            relay: Some(relay),
+            watcher: Some(std::sync::Arc::new(NoopWatcher)),
+        })
         .await
         .unwrap();
 
@@ -763,7 +760,10 @@ mod tests {
         device_a.join().await.unwrap();
         device_b.join().await.unwrap();
 
-        assert!(moved, "device B did not move the file after device A renamed it");
+        assert!(
+            moved,
+            "device B did not move the file after device A renamed it"
+        );
         let engine_b = device_b.service.engine.as_ref().unwrap();
         assert!(
             engine_b

@@ -653,9 +653,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{NodeKind, TreeIndex, TreeUpdate};
-    use crate::core::{
-        File, FileKind, Object, ObjectHash, ObjectId, Tree, TreeEntry,
-    };
+    use crate::core::{File, FileKind, Object, ObjectHash, ObjectId, Tree, TreeEntry};
     use crate::services::{ObjStore, Result, SyncError};
 
     #[test]

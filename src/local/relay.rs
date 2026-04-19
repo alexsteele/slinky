@@ -132,7 +132,11 @@ impl Relay for MemoryRelay {
     async fn subscribe(&self, repo_id: &String, _device_id: &String) -> Result<RelayEventStream> {
         let (tx, rx) = mpsc::channel(32);
         let mut state = self.state.lock().unwrap();
-        state.subscribers.entry(repo_id.clone()).or_default().push(tx);
+        state
+            .subscribers
+            .entry(repo_id.clone())
+            .or_default()
+            .push(tx);
         Ok(rx)
     }
 
